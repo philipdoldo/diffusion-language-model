@@ -1,6 +1,6 @@
-effective_batch_size: 128
+effective_batch_size: 4
 batch_size: 2
-grad_accum_steps: 1
+grad_accum_steps: 2
 training_steps: 10000
 
 train_shard_dir: "/mnt/data_r60_1/adv_robust_project/diffusion-language-model/OWT/train"
@@ -13,6 +13,7 @@ warmup_steps: 100
 
 val_loss_interval: 100
 checkpoint_interval: 100
+text_sample_interval: 100
 
 save_dir: "/mnt/data_r60_1/adv_robust_project/diffusion-language-model/experiments"
 
@@ -30,6 +31,8 @@ AdamW_weight_decay: 0.01
 AdamW_betas: [0.9, 0.95]
 AdamW_epsilon: 1.0e-8
 
-uniform_ctmc:
+UniformCTMC:
   sigma_min: 1.0e-4
   sigma_max: 20
+
+rng_seed: 21

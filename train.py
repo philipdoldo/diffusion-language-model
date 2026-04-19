@@ -88,7 +88,7 @@ class GeometricNoise:
         """
         if (t > 1).any() or (t < 0).any():
             raise ValueError(f"Expected t in [0,1], got {t=}")
-        return self.sigma_min**(1-t) * self.sigma_max**t * (torch.log(self.sigma_max) - torch.log(self.sigma_min))
+        return self.sigma_min**(1-t) * self.sigma_max**t * (torch.log(torch.tensor(self.sigma_max)) - torch.log(torch.tensor(self.sigma_min)))
 
 """
 For uniform diffusion, we are using Q = (11^T - N*I)/N = (1/N)*11^T - I and (1/N)*11^T is a projection matrix, so the matrix
@@ -101,8 +101,8 @@ at sequence position i) and we'll care about only the corresponding column of ou
 class UniformCTMC:
 
     def __init__(self, config):
-        self.noise = GeometricNoise(sigma_min=config["sigma_min"], sigma_max=config["sigma_max"])
-        self.N = config.vocab_size # the rate and transition matrices are N-by-N (this is all at the token level rather than the sequence level)
+        self.noise = GeometricNoise(sigma_min=config["UniformCTMC"]["sigma_min"], sigma_max=config["UniformCTMC"]["sigma_max"])
+        self.N = config["model"]["vocab_size"] # the rate and transition matrices are N-by-N (this is all at the token level rather than the sequence level)
 
     def transition(self, cols, t):
         """
@@ -132,8 +132,8 @@ class UniformCTMC:
         # for i in range(batch_size):
         #     for j in range(seq_len):
         #         for k in range(1):  # cols[..., None] has shape (batch_size, seq_len, 1)
-        #             p[i][j][cols[i][j][k]] += c[i] # assuming c has shape (batch_size, seq_len, 1), which doesn't happen without .expand()
-        p.scatter_add_(-1, cols[..., None], c.expand(batch_size, seq_len, 1))
+        #             p[i][j][cols[i][j][k]] += c[i][j][k] # assuming c has shape (batch_size, seq_len, 1), which doesn't happen without .expand()
+        p.scatter_add_(-1, cols[..., None].long(), c[:, None, None].expand(batch_size, seq_len, 1))
         return p # (batch_size, seq_len, N)
 
 
@@ -181,12 +181,22 @@ def loss_DWDSE(log_score_model, x_0, t, ctmc):
     x_t = sample_categorical(p) # (batch_size, seq_len)
     log_scores = log_score_model(token_ids=x_t, t=t) # (batch_size, seq_len, vocab_size)
     sigma = ctmc.noise.sigma(t) # (batch_size,)
+    print(f"{t=}")
+    print(f"{sigma=}")
+    print(f"{log_scores=}")
+    print(f"{x_t=}")
+    print(f"{p=}")
 
     # p.gather(dim=-1, index=x_t[..., None]) has the same shape as `index` which is (batch_size, seq_len, 1) in this case,
     # each value is basically p_{t|0}(x_t^{i}|x_0^{i}). 
     ratio = p / p.gather(dim=-1, index=x_t[..., None])  # (batch_size, seq_len, vocab_size)
+    assert not torch.isnan(ratio).any(), "DROSE"
+    assert not torch.isinf(ratio).any(), "OUU"
+    print(f"{ratio=}")
     loss = (log_scores.exp() - ratio * log_scores).sum(dim=-1)  # (batch_size, seq_len) -- log_scores were zero'd when x_t^{i} = y in the forward pass, so the sum is correct here
+    print(f"[y]: {loss=}")
     loss = (sigma[:, None] * loss).sum(dim=-1)  # (batch_size,)
+    print(f"[z]: {loss=}")
     loss = loss.mean()  # scalar
     return loss
 
@@ -329,7 +339,7 @@ if __name__ == "__main__":
 
     train_loader = ShardDataLoader(shard_dir=config["train_shard_dir"], batch_size=batch_size, seq_len=config["seq_len"])
     
-    torch.manual_seed(config.rng_seed + rank) # for sampling times
+    torch.manual_seed(config["rng_seed"] + rank) # for sampling times
 
     ctmc = UniformCTMC(config)
 
@@ -343,7 +353,7 @@ if __name__ == "__main__":
 
     for step in range(training_steps):
 
-        torch.synchronize()
+        torch.cuda.synchronize()
         t0 = time.time()
 
         x0, t = train_loader.next_batch()

@@ -258,6 +258,7 @@ class DiT(nn.Module):
 
         c = self.time_emb(t) # (batch_size, embed_dim)
         scale, shift = self.final_ada_ln_proj(c) # 2-tuple of tensors of shape (batch_size, embed_dim) 
+        print(f"{scale.shape=}, {shift.shape=}, {scale=}, {shift=}")
 
         x = self.token_emb(token_ids) # (batch_size, seq_len, embed_dim)
         for block in self.blocks:
