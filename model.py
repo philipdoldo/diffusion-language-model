@@ -238,22 +238,36 @@ class DiT(nn.Module):
         self.register_buffer("cos", cos, persistent=False) # persistent=False means it's not saved to the checkpoint
         self.register_buffer("sin", sin, persistent=False)
 
-    def forward(self, x, t):
+    def forward(self, token_ids, t):
         """
-        `x` has shape (batch_size, seq_len) and is a batch of token id sequences
+        `token_ids` has shape (batch_size, seq_len) and is a batch of token id sequences
         `t` has shape (batch_size,) and is a batch of times in [0,1]
+
+        For a given batch index, scores gives a seq_len-by-vocab_size matrix where entry
+        (i,j) represents p_t(j)/p_t(token_ids[batch_index][i]) which is only defined if the token
+        ids j and token_ids[batch_index][i] are different token ids. We will map the entries to 0
+        if they are the same.
         """
         cos_sin = self.cos, self.sin
 
         c = self.time_emb(t) # (batch_size, embed_dim)
         scale, shift = self.final_ada_ln_proj(c) # 2-tuple of tensors of shape (batch_size, embed_dim) 
 
-        x = self.token_emb(x) # (batch_size, seq_len, embed_dim)
+        x = self.token_emb(token_ids) # (batch_size, seq_len, embed_dim)
         for block in self.blocks:
             x = block(x=x, c=c, cos_sin=cos_sin)
         x = F.layer_norm(x, [x.shape[-1]]) * scale + shift
-        logits = self.lm_head(x)
-        return logits
+        scores = self.lm_head(x) # (batch_size, seq_len, vocab_size)
+
+        # Remove scores corresponding to the input token id by setting them to zero
+        # torch.scatter() is basically doing a vectorized version of this: 
+        # for i in range(batch_size):
+        #     for j in range(seq_len):
+        #         for k in range(1):  # token_ids[..., None] has shape (batch_size, seq_len, 1)
+        #             scores[i][j][token_ids[i][j][k]] = 0
+        scores = torch.scatter(scores, -1, token_ids[..., None], torch.zeros_like(scores[..., :1]))
+
+        return scores
 
 
 

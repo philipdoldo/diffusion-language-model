@@ -1,3 +1,5 @@
+import torch
+
 """
 We define a forward noising process using a CTMC. This CTMC has a time-dependent rate matrix, but it makes a significant
 simplifying assumption on its structure, namely, that the rate matrix can be written as sigma(t) * Q where Q is a fixed
@@ -60,8 +62,10 @@ class GeometricNoise:
         self.sigma_max = sigma_max
 
     def sigma_bar(self, t):
-        # TODO TODO TODO will `t` be a scalar or will it be shape (B,) or something?
-        if t > 1 or t < 0:
+        """
+        `t` has shape (batch_size,)
+        """
+        if (t > 1).any() or (t < 0).any():
             raise ValueError(f"Expected t in [0,1], got {t=}")
         return self.sigma_min**(1-t) * self.sigma_max**t
     
@@ -70,9 +74,11 @@ class GeometricNoise:
         This is the derivative of sigma_bar(t). In practice, we define sigma_bar(t) first and then take its derivative to get
         sigma(t) rather than starting with sigma(t) and computing sigma_bar(t) = int_{0}^{t} sigma(s) ds. There isn't a principled
         reason for this, this just happens to be what was done for this geometric noise schedule used in the SEDD paper.
+            `t` has shape (batch_size,)
         """
-        # TODO raise ValueError()
-        return sigma_min**(1-t) * sigma_max**t * (torch.log(sigma_max) - torch.log(sigma_min))
+        if (t > 1).any() or (t < 0).any():
+            raise ValueError(f"Expected t in [0,1], got {t=}")
+        return self.sigma_min**(1-t) * self.sigma_max**t * (torch.log(self.sigma_max) - torch.log(self.sigma_min))
 
 """
 For uniform diffusion, we are using Q = (11^T - N*I)/N = (1/N)*11^T - I and (1/N)*11^T is a projection matrix, so the matrix
@@ -81,4 +87,91 @@ exponential is very easy to compute. This makes it so that
 which defines our transition probabilities p_{t|0}. In practice, we are going to start at some initial state x_0^{i} (a given token
 at sequence position i) and we'll care about only the corresponding column of our transition matrix given by p_{t|0}(.|x_0^{i}).
 """
-# TODO define transition probabilities and such
+
+class UniformCTMC:
+
+    def __init__(self, config):
+        self.noise = GeometricNoise(sigma_min=config.sigma_min, sigma_max=config.sigma_max)
+        self.N = config.vocab_size # the rate and transition matrices are N-by-N (this is all at the token level rather than the sequence level)
+
+    def transition(self, cols, t):
+        """
+        For each batch and sequence position, get a column of the transition matrix p_{t|0}, specifically, get p_{t|0}(.|col) where col is a token id
+        We're just getting a column of 
+            exp(sigma_bar(t)*Q) = (1 - exp(-sigma_bar(t)))*(1/N)*11^T + exp(-sigma_bar(t))*I
+        which is just a vector of ones multiplied by the scalar (1 - exp(-sigma_bar(t)))*(1/N) plus the scalar exp(-sigma_bar(t)) in the col'th position
+
+        Really we need to generate a probability vector over tokens for every single position in our sequence (for the same time t), also we want to do
+        this for a batch of sequences, so we should have:
+            `t` shape (batch_size,)
+            `cols` shape (batch_size, seq_len) -- these are token sequences sampled from p_data (remember p_0 ~= p_data)
+        outputs `p` with shape (batch_size, seq_len, N) where N is the vocab size. The idea is that we can use this output to get a sample for batches of
+        the sequence at time t (x_t) which has shape (batch_size, seq_len) by independently sampling a token for each sequence position at each batch index
+        """
+        batch_size = t.shape[0]
+        seq_len = cols.shape[1]
+        if len(t.shape) > 1 or len(cols.shape) > 2 or t.shape[0] != cols.shape[0]:
+            raise ValueError(f"{t.shape=}, {cols.shape=}")
+        
+        sigma_bar = self.noise.sigma_bar(t) # (batch_size,)
+        c = torch.exp(-sigma_bar) # (batch_size,)
+        coeff = ((1 - c[:, None, None]) / self.N) # (batch_size, 1, 1)
+        p = coeff.expand(batch_size, seq_len, self.N).clone() # (batch_size, seq_len, N)
+
+        # We need to add c * I (i.e., add exp(-sigma_bar(t))*I)
+        # for i in range(batch_size):
+        #     for j in range(seq_len):
+        #         for k in range(1):  # cols[..., None] has shape (batch_size, seq_len, 1)
+        #             p[i][j][cols[i][j][k]] += c[i] # assuming c has shape (batch_size, seq_len, 1), which doesn't happen without .expand()
+        p.scatter_add_(-1, cols[..., None], c.expand(batch_size, seq_len, 1))
+        return p # (batch_size, seq_len, N)
+
+
+def sample_categorical(p):
+    """
+    `p` has shape (batch_size, seq_len, vocab_size) and is basically p_{t|0}(.|x_0^{i}) for each sequence index i and each batch index
+    This function samples a token in {0, ..., vocab_size-1} for each batch index and sequence position resulting in a tensor with
+    shape (batch_size, seq_len). This is effectively sampling x_t^{i} ~  p_{t|0}(.|x_0^{i}) for each sequence position i and batch index.
+
+    Motivated by https://github.com/louaaron/Score-Entropy-Discrete-Diffusion/blob/main/catsample.py#L10
+
+    ---
+    Notes:
+    Let p in R^n be a probability vector and let G_1, ..., G_n ~ Gumbel(0, 1) iid
+    We can use the fact that
+        argmax_{k in {1, ..., n}}( log(p_k) + G_k ) ~ Categorical(p)
+    However, we can equivalently let U_1, ..., U_n ~ Unif([0,1]) iid and then
+        argmax_{k in {1, ..., n}}( p_k / (-log(U_k)) ) ~ Categorical(p)
+    Note that if U ~ Unif([0,1]), then -log(U) ~ Exp(1) and if E ~ Exp(1), then -log(E) ~ Gumbel(0, 1), so
+        argmax_{k}( p_k / (-log(U_k)) ) = argmax_{k}( log(p_k) - log(-log(U_k)) ) = argmax_{k}( log(p_k) + G_k )
+    This way should actually be a little faster since it should be one fewer log computation since under the hood
+    pytorch generates gumbel samples by sampling U ~ Unif([0,1]) and then doing -log(-log(U)) ~ Gumbel(0, 1)
+
+    In practice we add a small tolerance inside and outside of the log to avoid log(0) or log(1) (the latter would cause division by 0)
+    """
+    eps = 1e-10
+    exp_norm = eps - torch.rand_like(p + eps).log() # -log(U) ~ Exp(1) if U ~ Unif([0,1])
+    return (p / exp_norm).argmax(dim=-1) # shape (batch_size, seq_len)
+
+
+def loss_DWDSE(score_model, x_0, t, ctmc):
+        #scores, p, sigma):
+    """
+    The Diffusion Weighted Denoising Score Entropy loss L_{DWDSE} from the SEDD paper https://arxiv.org/pdf/2310.16834 (see Algorithm 1)
+
+    `score_model` is our neural network that outputs `scores`
+    `x_0` has shape (batch_size, seq_len) and is a sequence of token ids sampled from p_data
+    `t` has shape (batch_size,)
+    `ctmc` is an instance of our UniformCTMC class, we'll use it to compute `p` and `sigma`
+
+    `scores` has shape (batch_size, seq_len, vocab_size) where scores corresponding to the original token id are 0 (see model.py)
+    `p` has shape (batch_size, seq_len, vocab_size) and represents p_{t|0}(.|x_0^{i}) for each sequence position i and each batch index
+    `sigma` has shape (batch_size,) and is simply sigma(t) corresponding to the noise schedule being used
+    """
+    p = ctmc.transition(cols=x_0, t=t) # (batch_size, seq_len, vocab_size)
+    x_t = sample_categorical(p) # (batch_size, seq_len)
+    scores = score_model(token_ids=x_t, t=t) # (batch_size, seq_len, vocab_size)
+    sigma = ctmc.noise.sigma(t) # (batch_size,)
+
+    
+    
