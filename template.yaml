@@ -1,0 +1,35 @@
+effective_batch_size: 128
+batch_size: 2
+grad_accum_steps: 1
+training_steps: 10000
+
+train_shard_dir: "/mnt/data_r60_1/adv_robust_project/diffusion-language-model/OWT/train"
+seq_len: 512
+
+# Cosine Decay LR Schedule
+max_lr: 3.0e-4
+min_lr: 3.0e-5
+warmup_steps: 100
+
+val_loss_interval: 100
+checkpoint_interval: 100
+
+save_dir: "/mnt/data_r60_1/adv_robust_project/diffusion-language-model/experiments"
+
+model:
+  vocab_size: 50304
+  embed_dim: 768
+  cond_dim: 768
+  sine_base: 10000
+  num_attention_heads: 12
+  rotary_base: 10000
+  num_blocks: 4
+  max_seq_len: 2048
+
+AdamW_weight_decay: 0.01
+AdamW_betas: [0.9, 0.95]
+AdamW_epsilon: 1.0e-8
+
+uniform_ctmc:
+  sigma_min: 1.0e-4
+  sigma_max: 20

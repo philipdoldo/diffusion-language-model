@@ -1,6 +1,14 @@
 import torch
 import argparse
 import yaml
+import os
+import math
+import time
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from datetime import datetime
+from model import DiT, DiTConfig
+from dataloader import ShardDataLoader
 
 """
 We define a forward noising process using a CTMC. This CTMC has a time-dependent rate matrix, but it makes a significant
@@ -93,7 +101,7 @@ at sequence position i) and we'll care about only the corresponding column of ou
 class UniformCTMC:
 
     def __init__(self, config):
-        self.noise = GeometricNoise(sigma_min=config.sigma_min, sigma_max=config.sigma_max)
+        self.noise = GeometricNoise(sigma_min=config["sigma_min"], sigma_max=config["sigma_max"])
         self.N = config.vocab_size # the rate and transition matrices are N-by-N (this is all at the token level rather than the sequence level)
 
     def transition(self, cols, t):
@@ -191,7 +199,37 @@ We'll sample a batch of times t ~ Unif([0,1]), it'll have shape (batch_size,)
 We can directly feed these into our loss function along with our model which outputs log scores and our CTMC that defines our forward noising process.
 Since our loss averages across the entire batch, we can scale it for gradient accumulation easily. 
 
+TODO inference, val loss, perplexity/gen perplexity+entropy, checkpointing, resuming training, sharded optimizer, fp16+scaler/bf16 handling, etc
+
 """
+
+def print0(s="", **kwargs):
+    ddp_rank = int(os.environ.get('RANK', 0))
+    if ddp_rank == 0:
+        print(s, **kwargs)
+
+def write0(s, log_file):
+    """
+    `s` is the string to write to the log file
+    `log_file` is the path to the log.txt file
+    """
+    ddp_rank = int(os.environ.get('RANK', 0))
+    if ddp_rank == 0:
+        with open(log_file, 'a') as f:
+            f.write(s)
+
+def create_log_dir(parent_dir):
+    ddp_rank = int(os.environ.get('RANK', 0))
+    log_dir = None # initialize as None to avoid errors on nonzero ranks
+    if ddp_rank == 0:
+        timestamp = datetime.now().strftime("%m-%d-%Y-%Hh%Mm%Ss")
+        log_dir = os.path.join(parent_dir, f"{timestamp}")
+        os.makedirs(log_dir, exist_ok=True)
+        checkpoint_dir = os.path.join(log_dir, "checkpoints") # store checkpoints here
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        sample_dir = os.path.join(log_dir, "samples") # store image samples made during training here
+        os.makedirs(sample_dir, exist_ok=True)
+    return log_dir
 
 if __name__ == "__main__":
 
@@ -201,12 +239,144 @@ if __name__ == "__main__":
 
     with open(args.config, "r") as f:
         config = yaml.safe_load(f)
+    
+    effective_batch_size = config["effective_batch_size"]
+    batch_size = config["batch_size"]
+    grad_accum_steps = config["grad_accum_steps"]
+    training_steps = config["training_steps"]
 
+    val_loss_interval = config["val_loss_interval"]
+    checkpoint_interval = config["checkpoint_interval"]
+    text_sample_interval = config["text_sample_interval"]
 
-    # TODO define dataloader and inference sampling
+    save_dir = config["save_dir"]
 
+    log_dir = create_log_dir(save_dir)
+
+    # Learning Rate Schedule (Cosine Decay)
+    warmup_steps = config["warmup_steps"]
+    max_lr = config["max_lr"]
+    min_lr = config.get("min_lr", max_lr/10)
+    lr_decay_steps = training_steps - warmup_steps
+    def get_lr(it):
+        # 1) linear warmup for warmup_steps steps
+        if it < warmup_steps:
+            return max_lr * (it + 1) / (warmup_steps + 1)
+        # 2) if it > lr_decay_steps, return min learning rate
+        if it > lr_decay_steps:
+            return min_lr
+        # 3) in between, use cosine decay down to min learning rate
+        decay_ratio = (it - warmup_steps) / (lr_decay_steps - warmup_steps)
+        assert 0 <= decay_ratio <= 1
+        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
+        return min_lr + coeff * (max_lr - min_lr)
+
+    model_config = DiTConfig.from_dict(config["model"])
+    model = DiT(model_config) # this model outputs the log of the scores
+
+    ddp = int(os.environ.get('RANK', -1)) != -1
+
+    if ddp:
+        dist.init_process_group(backend='nccl')
+        rank = int(os.environ['RANK'])
+        local_rank = int(os.environ['LOCAL_RANK'])
+        world_size = dist.get_world_size()
+
+        assert rank == dist.get_rank(), f"{rank=}, {dist.get_rank()=}"
+
+        device = f'cuda:{local_rank}'
+        torch.cuda.set_device(device)
+        print(f"{rank=}, {local_rank=}, {world_size=}, {device=}")
+    else:
+        rank = 0
+        local_rank = 0
+        world_size = 1
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        print(f"{rank=}, {local_rank=}, {world_size=}, {device=}")
+
+    # sanity check inputs
+    if world_size * batch_size * grad_accum_steps != effective_batch_size:
+        raise ValueError(f"{effective_batch_size=}, {world_size=}, {batch_size=}, {grad_accum_steps=}, {world_size*batch_size*grad_accum_steps=}")
+
+    # Initialize log file
+    log_file = f"{log_dir}/log.txt"
+    if rank == 0:
+        with open(log_file, 'w') as f:
+            f.write("") # initialize log file
+
+        with open(os.path.join(log_dir, "config.yaml"), "w") as f:
+            yaml.dump(config, f) # save copy of yaml in log directory
+
+    # Write basic info at start of log file (config, GPU info, etc.)
+    write0("Config:\n", log_file=log_file)
+    for key, value in config.items():
+        if isinstance(value, dict):
+            write0(f"  {key}:\n", log_file=log_file)
+            for subkey, subvalue in value.items():
+                write0(f"    {subkey}: {subvalue}\n", log_file=log_file)
+        else:
+            write0(f"  {key}: {value}\n", log_file=log_file)
+    write0(f"Using {world_size} GPU(s)\n", log_file=log_file)
+    write0(f"GPU Type: {torch.cuda.get_device_name()}\n", log_file=log_file)
+
+    model = model.to(device)
+    if ddp:
+        model = DDP(model, device_ids=[local_rank])
+
+    num_params = sum(p.numel() for p in model.parameters())
+    num_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    write0(f"Model Parameters: {num_params:,}\nTrainable Model Parameters: {num_trainable_params:,}\n", log_file=log_file)
+
+    train_loader = ShardDataLoader(shard_dir=config["train_shard_dir"], batch_size=batch_size, seq_len=config["seq_len"])
     
     torch.manual_seed(config.rng_seed + rank) # for sampling times
 
+    ctmc = UniformCTMC(config)
 
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        weight_decay=config["AdamW_weight_decay"],
+        betas=config["AdamW_betas"],
+        eps=config["AdamW_epsilon"],
+        fused=True
+        )
+
+    for step in range(training_steps):
+
+        torch.synchronize()
+        t0 = time.time()
+
+        x0, t = train_loader.next_batch()
+        x0 = x0.to(device)
+        t = t.to(device)
+
+        train_loss = 0.0 # for logging
+        for micro_step in range(grad_accum_steps):
+
+            if ddp: # only sync gradients on the last micro step
+                model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
+
+            # Effective batch size is per_gpu_batch_size * num_gpus * grad_accum_steps. Before syncing gradients, the local gradient has
+            # per_gpu_batch_size in the denominator (since the loss is averaged over the local batch) and then when we sync gradients with
+            # the .backward() call (with require_backward_grad_sync True), they are averaged over all ranks, so the resulting gradient has
+            # per_gpu_batch_size * num_gpus in the denominator. Dividing the loss by grad_accum_steps gives us the correct final denominator.
+            loss = loss_DWDSE(log_score_model=model, x_0=x0, t=t, ctmc=ctmc) / grad_accum_steps
+            train_loss += loss.detach() # for logging
+            loss.backward()
+
+        if dist.is_initialized():
+            dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # for logging
+        
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = get_lr(step)
+        optimizer.step()
+        model.zero_grad(set_to_none=True)
+        torch.cuda.synchronize()
+        t1 = time.time()
+
+        write0(f"Step {step}:{' '*(8 - len(str(step)))}{(t1-t0)*1000:.0f}ms    train loss: {train_loss.item():.6f}    grad norm: {norm.item():.6f}\n", log_file=log_file)
     
+    if ddp:
+        dist.destroy_process_group()

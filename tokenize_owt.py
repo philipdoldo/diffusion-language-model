@@ -9,6 +9,8 @@ directories are subdirectories of --output_dir.
 
 For testing purposes, run on a small subset (e.g. the first 1000 documents):
     python tokenize_owt.py --shard_size 131072 --subset 1000
+
+# TODO I should use one big memmap instead of shards in the future
 """
 import os
 import argparse
