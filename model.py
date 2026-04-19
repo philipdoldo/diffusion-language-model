@@ -87,7 +87,8 @@ class AdaLNProjection(nn.Module):
     shifts: beta1, beta2 in DiT paper
     gates: alpha1, alpha2 in DiT paper
 
-    default behavior outputs a 6-tuple of tensors of shape (batch_size, embed_dim)
+    default behavior outputs a 6-tuple of tensors of shape (batch_size, 1, embed_dim)
+    We need the 1 dimension to allow for broadcasting with tensors of shape (batch_size, seq_len, embed_dim) in the DiT
     """
     def __init__(self, embed_dim, cond_dim, output_factor=6):
         super().__init__()
@@ -103,7 +104,7 @@ class AdaLNProjection(nn.Module):
         """
         c = F.silu(c)
         c = self.W(c) # (batch_size, output_factor*embed_dim)
-        return c.chunk(self.output_factor, dim=-1) # output_factor-tuple where each entry has shape (batch_size, embed_dim)
+        return c.unsqueeze(1).chunk(self.output_factor, dim=-1) # output_factor-tuple where each entry has shape (batch_size, 1, embed_dim)
 
 
 def precompute_rotary_embeddings(seq_len, head_dim, base=10000):
@@ -234,7 +235,7 @@ class DiT(nn.Module):
         head_dim = config.embed_dim // config.num_attention_heads
         assert config.num_attention_heads * head_dim == config.embed_dim, f"{config.num_attention_heads=}, {head_dim=}, {config.embed_dim=}, {config.embed_dim % config.num_attention_heads=}"
 
-        cos, sin = precompute_rotary_embeddings(seq_len=config["max_seq_len"], head_dim=head_dim, base=config.rotary_base)
+        cos, sin = precompute_rotary_embeddings(seq_len=config.max_seq_len, head_dim=head_dim, base=config.rotary_base)
         self.register_buffer("cos", cos, persistent=False) # persistent=False means it's not saved to the checkpoint
         self.register_buffer("sin", sin, persistent=False)
 
@@ -245,8 +246,13 @@ class DiT(nn.Module):
 
         For a given batch index, scores gives a seq_len-by-vocab_size matrix where entry
         (i,j) represents p_t(j)/p_t(token_ids[batch_index][i]) which is only defined if the token
-        ids j and token_ids[batch_index][i] are different token ids. We will map the entries to 0
-        if they are the same.
+        ids j and token_ids[batch_index][i] are different token ids. 
+
+        Important: We are actually learning the log of the scores here instead of the scores because
+        it makes the loss a bit easier to compute. Entries corresponding to the same token id will get
+        mapped to 0. This makes the sum excluding the same token in L_DWDSE easier to compute. This
+        means that we need to exponentiate the model output when doing inference to obtain the actual
+        scores. I took this idea from (for example) here: https://github.com/louaaron/Score-Entropy-Discrete-Diffusion/blob/main/model/utils.py#L51
         """
         cos_sin = self.cos, self.sin
 
@@ -257,7 +263,7 @@ class DiT(nn.Module):
         for block in self.blocks:
             x = block(x=x, c=c, cos_sin=cos_sin)
         x = F.layer_norm(x, [x.shape[-1]]) * scale + shift
-        scores = self.lm_head(x) # (batch_size, seq_len, vocab_size)
+        log_scores = self.lm_head(x) # (batch_size, seq_len, vocab_size)
 
         # Remove scores corresponding to the input token id by setting them to zero
         # torch.scatter() is basically doing a vectorized version of this: 
@@ -265,11 +271,26 @@ class DiT(nn.Module):
         #     for j in range(seq_len):
         #         for k in range(1):  # token_ids[..., None] has shape (batch_size, seq_len, 1)
         #             scores[i][j][token_ids[i][j][k]] = 0
-        scores = torch.scatter(scores, -1, token_ids[..., None], torch.zeros_like(scores[..., :1]))
+        log_scores = torch.scatter(log_scores, -1, token_ids[..., None], torch.zeros_like(log_scores[..., :1]))
 
-        return scores
+        return log_scores
 
+if __name__ == "__main__":
 
+    config = DiTConfig()
+    model = DiT(config)
+
+    batch_size = 2
+    token_ids = torch.randint(0, config.vocab_size, (batch_size, 256))
+    t = torch.rand((batch_size,))
+    print(f"{token_ids.shape=}, {t.shape=}")
+
+    log_scores = model(token_ids=token_ids, t=t)
+    print(f"{log_scores.shape=}")
+
+    params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"{params=:,}, {trainable_params=:,}")
 
 
 

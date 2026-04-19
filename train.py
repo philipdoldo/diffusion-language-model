@@ -1,4 +1,6 @@
 import torch
+import argparse
+import yaml
 
 """
 We define a forward noising process using a CTMC. This CTMC has a time-dependent rate matrix, but it makes a significant
@@ -154,24 +156,57 @@ def sample_categorical(p):
     return (p / exp_norm).argmax(dim=-1) # shape (batch_size, seq_len)
 
 
-def loss_DWDSE(score_model, x_0, t, ctmc):
-        #scores, p, sigma):
+def loss_DWDSE(log_score_model, x_0, t, ctmc):
     """
     The Diffusion Weighted Denoising Score Entropy loss L_{DWDSE} from the SEDD paper https://arxiv.org/pdf/2310.16834 (see Algorithm 1)
 
-    `score_model` is our neural network that outputs `scores`
+    `log_score_model` is our neural network that outputs `log_scores`
     `x_0` has shape (batch_size, seq_len) and is a sequence of token ids sampled from p_data
     `t` has shape (batch_size,)
     `ctmc` is an instance of our UniformCTMC class, we'll use it to compute `p` and `sigma`
 
-    `scores` has shape (batch_size, seq_len, vocab_size) where scores corresponding to the original token id are 0 (see model.py)
+    `log_scores` has shape (batch_size, seq_len, vocab_size) where log_scores corresponding to the original token id are 0 (see model.py)
     `p` has shape (batch_size, seq_len, vocab_size) and represents p_{t|0}(.|x_0^{i}) for each sequence position i and each batch index
     `sigma` has shape (batch_size,) and is simply sigma(t) corresponding to the noise schedule being used
     """
     p = ctmc.transition(cols=x_0, t=t) # (batch_size, seq_len, vocab_size)
     x_t = sample_categorical(p) # (batch_size, seq_len)
-    scores = score_model(token_ids=x_t, t=t) # (batch_size, seq_len, vocab_size)
+    log_scores = log_score_model(token_ids=x_t, t=t) # (batch_size, seq_len, vocab_size)
     sigma = ctmc.noise.sigma(t) # (batch_size,)
 
+    # p.gather(dim=-1, index=x_t[..., None]) has the same shape as `index` which is (batch_size, seq_len, 1) in this case,
+    # each value is basically p_{t|0}(x_t^{i}|x_0^{i}). 
+    ratio = p / p.gather(dim=-1, index=x_t[..., None])  # (batch_size, seq_len, vocab_size)
+    loss = (log_scores.exp() - ratio * log_scores).sum(dim=-1)  # (batch_size, seq_len) -- log_scores were zero'd when x_t^{i} = y in the forward pass, so the sum is correct here
+    loss = (sigma[:, None] * loss).sum(dim=-1)  # (batch_size,)
+    loss = loss.mean()  # scalar
+    return loss
+
+"""
+Now for the actual training loop...
+
+We'll sample x_0 ~ p_data by having our dataloader give us batches of sequences of token ids from our dataset. It'll have shape (batch_size, seq_len)
+We'll sample a batch of times t ~ Unif([0,1]), it'll have shape (batch_size,)
+
+We can directly feed these into our loss function along with our model which outputs log scores and our CTMC that defines our forward noising process.
+Since our loss averages across the entire batch, we can scale it for gradient accumulation easily. 
+
+"""
+
+if __name__ == "__main__":
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, required=True)
+    args = parser.parse_args()
+
+    with open(args.config, "r") as f:
+        config = yaml.safe_load(f)
+
+
+    # TODO define dataloader and inference sampling
+
     
+    torch.manual_seed(config.rng_seed + rank) # for sampling times
+
+
     
