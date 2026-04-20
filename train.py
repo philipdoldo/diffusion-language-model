@@ -135,6 +135,82 @@ class UniformCTMC:
         #             p[i][j][cols[i][j][k]] += c[i][j][k] # assuming c has shape (batch_size, seq_len, 1), which doesn't happen without .expand()
         p.scatter_add_(-1, cols[..., None].long(), c[:, None, None].expand(batch_size, seq_len, 1))
         return p # (batch_size, seq_len, N)
+    
+    def loss_DWDSE(log_score_model, x_0, t):
+        """
+        The Diffusion Weighted Denoising Score Entropy loss L_{DWDSE} from the SEDD paper https://arxiv.org/pdf/2310.16834 (see Algorithm 1)
+
+        `log_score_model` is our neural network that outputs `log_scores`
+        `x_0` (batch_size, seq_len)
+        `t` (batch_size,)
+
+        `x_t` (batch_size, seq_len) -- we use x_0 to get the transition probabilities p_{t|0}(.|x_0) so we can sample x_t
+        `log_scores` (batch_size, seq_len, vocab_size) -- once we have x_t, we can use x_t and t to call our model to get the log scores
+        
+        We split the loss up into 3 terms: pos_term, neg_term, constant (all of which will be weighted by sigma(t) at the end), so we'll get
+            sigma(t) * (pos_term - neg_term + constant)
+        The gradient does not depend on the constant term, but without it our loss can be negative and harder to interpret
+
+        pos_term is the sum of the scores s_{theta}(x_t, t)_{i, y} over all y=/=x_t^i for a given sequence position i. Shape: (batch_size, seq_len)
+        neg_term is the p_{t|0}(y|x_0^i)/p_{t|0}(x_t^i|x_0^i) * log(s_{theta}(x_t, t)_{i, y}) summed over all y=/=x_t^i for a given sequence
+        position i, where each term in the sum is a ratio multiplied by a log score. We can efficiently compute the ratios by considering a few cases:
+        (N refers to the vocab size.)
+
+            Case 1: x_t^i = x_0^i, y =/= x_t^i 
+                ratio = p_{t|0}(y|x_0^i)/p_{t|0}(x_t^i|x_0^i) = p_{t|0}(y|x_0^i)/p_{t|0}(x_0^i|x_0^i) = 1 - N/(exp(sigma_bar(t)) - 1 + N)
+
+            Case 2: x_t^i =/= x_0^i, y =/= x_t^i
+                Case 2a: y =/= x_0^i
+                    ratio = 1    (because neither y nor x_t^i are equal to x_0, they both have the same probability)
+                Case 2b: y = x_0^i
+                    ratio = 1 + N/(exp(sigma_bar(t)) - 1)    (this is just the reciprocal of the ratio from Case 1)
+
+                    (note that Case 2b only matters for a single term in our sum over all vocabulary tokens y =/= x_t^t, it is the term corresponding
+                    to the single time that y is equal to x_0^i, Case 2a will apply to all other terms in the sum)
+
+        I got this implementation idea from https://github.com/louaaron/Score-Entropy-Discrete-Diffusion/blob/main/graph_lib.py#L162
+ 
+        """
+        p = self.transition(cols=x_0, t=t) # (batch_size, seq_len, vocab_size)
+        x_t = sample_categorical(p) # (batch_size, seq_len)
+        log_scores = log_score_model(token_ids=x_t, t=t) # (batch_size, seq_len, vocab_size)
+
+        scores = log_scores.exp() # (batch_size, seq_len, vocab_size)
+        pos_term = scores.mean(dim=-1) - torch.gather(scores, x_t[..., None]).squeeze(-1) / self.N # for each sequence position i, we subtract away the term in the scores where y == x_t^i (and we normalize all terms by N)
+
+        sigma_bar = self.noise.sigma_bar(t[:, None]) # (batch_size, 1)
+        # Compute  exp(sigma_bar(t)) - 1  in a numerically stable way
+        em1 = torch.where(
+            sigma_bar < 0.5, # SEDD code uses 0.5, seems to be an arbitrary threshold for numerical stability (I expect it could be a lot smaller than 0.5?)
+            torch.expm1(sigma_bar),
+            torch.exp(sigma_bar) - 1 # I guess it is computationally fast to do this when numerical stability isn't a concern
+        ) # shape (batch_size, 1)
+
+        ratio = 1 - self.N / (em1 + self.N) # From Case 1: x_t^i == x_0^i, y != x_t^i, shape (batch_size, 1)
+
+        # for a given batch index and sequence position i, this is the sum of log scores over all y in the vocabulary minus the one term where y == x_t^i (all normalized by N)
+        neg_term = log_scores.mean(dim=-1) - torch.gather(log_scores, -1, x_t[..., None]).squeeze(-1) / self.N # (batch_size, seq_len)
+        neg_term = torch.where(
+            x_t == x_0,
+            ratio * neg_term, # Case 1: x_t^i == x_0^i, y != x_t^i 
+            neg_term + torch.gather(log_scores, -1, x_0[..., None]).squeeze(-1) / em1 # Case 2a is ratio=1, Case 2b is ratio=1+N/em1, neg_term is already (1/N) multiplied by each log score, we just need to add 1/em1 multiplied by the log score for x_0^i to get the proper ratio for that term (remember, all terms are normalized by N)
+        ) # shape (batch_size, seq_len)
+
+        # Constant term is sum of K(ratio) over all the ratios we used in neg_term, where K(a) := a*(log(a) - 1) 
+        constant = torch.where(
+            x_t == x_0,
+            ratio*(ratio.log() - 1) * (self.N - 1)/self.N, # Case 1, all ratios are the same and normalized by N, but we have N-1 terms, so (N-1)/N times the same K(ratio)
+            ((-ratio.log() - 1) / ratio - (self.N - 2)) / self.N  # for all but one term, we get K(1) = 1*(log(1) - 1) = -1 (there are N-2 of these terms), for the remaining term the ratio we want is the reciprocal of the Case 1 ratio, so we use 1/ratio and -log(ratio) to get K(1/ratio) = (-ratio.log() - 1) / ratio. Finally, we normalize everything by N
+        ) # (batch_size, seq_len)
+
+        sigma = self.noise.sigma(t) # (batch_size,)
+        loss = sigma * (pos_term - neg_term + constant).sum(dim=-1) # (batch_size,)
+        return loss.mean() # scalar
+
+
+
+
+
 
 
 def sample_categorical(p):
@@ -164,83 +240,86 @@ def sample_categorical(p):
     return (p / exp_norm).argmax(dim=-1) # shape (batch_size, seq_len)
 
 
-def loss_DWDSE(log_score_model, x_0, t, ctmc):
-    """
-    The Diffusion Weighted Denoising Score Entropy loss L_{DWDSE} from the SEDD paper https://arxiv.org/pdf/2310.16834 (see Algorithm 1)
+# def loss_DWDSE(log_score_model, x_0, t, ctmc):
+#     """
+#     The Diffusion Weighted Denoising Score Entropy loss L_{DWDSE} from the SEDD paper https://arxiv.org/pdf/2310.16834 (see Algorithm 1)
 
-    `log_score_model` is our neural network that outputs `log_scores`
-    `x_0` has shape (batch_size, seq_len) and is a sequence of token ids sampled from p_data
-    `t` has shape (batch_size,)
-    `ctmc` is an instance of our UniformCTMC class, we'll use it to compute `p` and `sigma`
+#     `log_score_model` is our neural network that outputs `log_scores`
+#     `x_0` has shape (batch_size, seq_len) and is a sequence of token ids sampled from p_data
+#     `t` has shape (batch_size,)
+#     `ctmc` is an instance of our UniformCTMC class, we'll use it to compute `p` and `sigma`
 
-    `log_scores` has shape (batch_size, seq_len, vocab_size) where log_scores corresponding to the original token id are 0 (see model.py)
-    `p` has shape (batch_size, seq_len, vocab_size) and represents p_{t|0}(.|x_0^{i}) for each sequence position i and each batch index
-    `sigma` has shape (batch_size,) and is simply sigma(t) corresponding to the noise schedule being used
-    """
-    # p = ctmc.transition(cols=x_0, t=t)  # (batch_size, seq_len, vocab_size)
-    # x_t = sample_categorical(p)  # (batch_size, seq_len)
-    # log_scores = log_score_model(token_ids=x_t, t=t)  # (batch_size, seq_len, vocab_size)
-    # sigma_bar = ctmc.noise.sigma_bar(t)  # (batch_size,)
-    # dsigma = ctmc.noise.sigma(t)  # (batch_size,)
-    # N = ctmc.N
+#     `log_scores` has shape (batch_size, seq_len, vocab_size) where log_scores corresponding to the original token id are 0 (see model.py)
+#     `p` has shape (batch_size, seq_len, vocab_size) and represents p_{t|0}(.|x_0^{i}) for each sequence position i and each batch index
+#     `sigma` has shape (batch_size,) and is simply sigma(t) corresponding to the noise schedule being used
+#     """
+#     # p = ctmc.transition(cols=x_0, t=t)  # (batch_size, seq_len, vocab_size)
+#     # x_t = sample_categorical(p)  # (batch_size, seq_len)
+#     # log_scores = log_score_model(token_ids=x_t, t=t)  # (batch_size, seq_len, vocab_size)
+#     # sigma_bar = ctmc.noise.sigma_bar(t)  # (batch_size,)
+#     # dsigma = ctmc.noise.sigma(t)  # (batch_size,)
+#     # N = ctmc.N
 
-    # esigm1 = torch.where(
-    #     sigma_bar[:, None] < 0.5,
-    #     torch.expm1(sigma_bar[:, None]),
-    #     sigma_bar[:, None].exp() - 1
-    # )  # (batch_size, seq_len)
+#     # esigm1 = torch.where(
+#     #     sigma_bar[:, None] < 0.5,
+#     #     torch.expm1(sigma_bar[:, None]),
+#     #     sigma_bar[:, None].exp() - 1
+#     # )  # (batch_size, seq_len)
 
-    # # ratio = 1 - N / (esigm1 + N), the true score ratio when x_t == x_0
-    # ratio = 1 - N / (esigm1 + N)  # (batch_size, seq_len)
+#     # # ratio = 1 - N / (esigm1 + N), the true score ratio when x_t == x_0
+#     # ratio = 1 - N / (esigm1 + N)  # (batch_size, seq_len)
 
-    # # pos_term: (1/N) * sum_{y != x_t} s_theta(x_t)_y
-    # scores = log_scores.exp()  # (batch_size, seq_len, vocab_size)
-    # pos_term = scores.mean(dim=-1) - scores.gather(-1, x_t[..., None]).squeeze(-1) / N  # (batch_size, seq_len)
+#     # # pos_term: (1/N) * sum_{y != x_t} s_theta(x_t)_y
+#     # scores = log_scores.exp()  # (batch_size, seq_len, vocab_size)
+#     # pos_term = scores.mean(dim=-1) - scores.gather(-1, x_t[..., None]).squeeze(-1) / N  # (batch_size, seq_len)
 
-    # # neg_term: analytically computed using structure of uniform transition matrix
-    # log_score_sum = log_scores.mean(dim=-1) - log_scores.gather(-1, x_t[..., None]).squeeze(-1) / N  # (batch_size, seq_len)
-    # no_move = (x_t == x_0.long())  # (batch_size, seq_len)
-    # neg_term = torch.where(
-    #     no_move,
-    #     ratio * log_score_sum,
-    #     log_scores.gather(-1, x_0[..., None].long()).squeeze(-1) / esigm1 + log_score_sum
-    # )  # (batch_size, seq_len)
+#     # # neg_term: analytically computed using structure of uniform transition matrix
+#     # log_score_sum = log_scores.mean(dim=-1) - log_scores.gather(-1, x_t[..., None]).squeeze(-1) / N  # (batch_size, seq_len)
+#     # no_move = (x_t == x_0.long())  # (batch_size, seq_len)
+#     # neg_term = torch.where(
+#     #     no_move,
+#     #     ratio * log_score_sum,
+#     #     log_scores.gather(-1, x_0[..., None].long()).squeeze(-1) / esigm1 + log_score_sum
+#     # )  # (batch_size, seq_len)
 
-    # # const: K(r) term, makes loss non-negative, no gradient w.r.t. theta
-    # const = torch.where(
-    #     no_move,
-    #     (N - 1) / N * ratio * (ratio.log() - 1),
-    #     ((-ratio.log() - 1) / ratio - (N - 2)) / N
-    # ).detach()  # (batch_size, seq_len)
+#     # # const: K(r) term, makes loss non-negative, no gradient w.r.t. theta
+#     # const = torch.where(
+#     #     no_move,
+#     #     (N - 1) / N * ratio * (ratio.log() - 1),
+#     #     ((-ratio.log() - 1) / ratio - (N - 2)) / N
+#     # ).detach()  # (batch_size, seq_len)
 
-    # loss = pos_term - neg_term + const  # (batch_size, seq_len)
-    # loss = (dsigma[:, None] * loss).sum(dim=-1)  # (batch_size,)
-    # loss = loss.mean()  # scalar
-    # return loss
-    p = ctmc.transition(cols=x_0, t=t) # (batch_size, seq_len, vocab_size)
-    x_t = sample_categorical(p) # (batch_size, seq_len)
-    log_scores = log_score_model(token_ids=x_t, t=t) # (batch_size, seq_len, vocab_size)
-    sigma = ctmc.noise.sigma(t) # (batch_size,)
-    print(f"{t=}")
-    print(f"{sigma=}")
-    print(f"{log_scores=}")
-    print(f"{x_t=}")
-    print(f"{p=}")
-    vocab_size = p.shape[-1]
-    print(f"{vocab_size=}")
+#     # loss = pos_term - neg_term + const  # (batch_size, seq_len)
+#     # loss = (dsigma[:, None] * loss).sum(dim=-1)  # (batch_size,)
+#     # loss = loss.mean()  # scalar
+#     # return loss
 
-    # p.gather(dim=-1, index=x_t[..., None]) has the same shape as `index` which is (batch_size, seq_len, 1) in this case,
-    # each value is basically p_{t|0}(x_t^{i}|x_0^{i}). 
-    ratio = p / p.gather(dim=-1, index=x_t[..., None])  # (batch_size, seq_len, vocab_size)
-    assert not torch.isnan(ratio).any(), "DROSE"
-    assert not torch.isinf(ratio).any(), "OUU"
-    print(f"{ratio=}")
-    loss = (log_scores.exp() - ratio * log_scores).sum(dim=-1) / vocab_size  # (batch_size, seq_len) -- log_scores were zero'd when x_t^{i} = y in the forward pass, so the sum is correct here
-    print(f"[y]: {loss=}")
-    loss = (sigma[:, None] * loss).sum(dim=-1)  # (batch_size,)
-    print(f"[z]: {loss=}")
-    loss = loss.mean()  # scalar
-    return loss
+#     ############################################################## original
+#     p = ctmc.transition(cols=x_0, t=t) # (batch_size, seq_len, vocab_size)
+#     x_t = sample_categorical(p) # (batch_size, seq_len)
+#     log_scores = log_score_model(token_ids=x_t, t=t) # (batch_size, seq_len, vocab_size)
+#     sigma = ctmc.noise.sigma(t) # (batch_size,)
+#     # print(f"{t=}")
+#     # print(f"{sigma=}")
+#     # print(f"{log_scores=}")
+#     # print(f"{x_t=}")
+#     # print(f"{p=}")
+#     vocab_size = p.shape[-1]
+#     # print(f"{vocab_size=}")
+
+#     # p.gather(dim=-1, index=x_t[..., None]) has the same shape as `index` which is (batch_size, seq_len, 1) in this case,
+#     # each value is basically p_{t|0}(x_t^{i}|x_0^{i}). 
+#     ratio = p / p.gather(dim=-1, index=x_t[..., None])  # (batch_size, seq_len, vocab_size)
+#     # print(f"{ratio=}")
+#     log_scores_exp = log_scores.exp()
+#     log_scores_exp = torch.scatter(log_scores_exp, -1, x_t[..., None], torch.zeros_like(log_scores[..., :1]))
+
+#     loss = (log_scores.exp() - ratio * log_scores).sum(dim=-1) / vocab_size  # (batch_size, seq_len) -- log_scores were zero'd when x_t^{i} = y in the forward pass, so the sum is correct here
+#     # print(f"[y]: {loss=}")
+#     loss = (sigma[:, None] * loss).sum(dim=-1)  # (batch_size,)
+#     # print(f"[z]: {loss=}")
+#     loss = loss.mean()  # scalar
+#     return loss
 
 """
 Now for the actual training loop...
@@ -395,6 +474,24 @@ if __name__ == "__main__":
 
     for step in range(training_steps):
 
+        # SAVE CHECKPOINTS
+        if ddp_rank == 0 and (step % checkpoint_interval == 0 or step == training_steps - 1):
+            torch.cuda.synchronize()
+            t0 = time.time()
+            checkpoint = {
+                'step': step,
+                'model': model.module.state_dict() if ddp else model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+            }
+            checkpoint_path = os.path.join(log_dir, f'checkpoints/checkpoint_step{step}.pt')
+            torch.save(checkpoint, checkpoint_path)
+            torch.cuda.synchronize()
+            t1 = time.time()
+            write0(f" --- Checkpoint saved to {checkpoint_path} in {t1-t0:.4f}s\n", log_file=log_file)
+
+
+
+
         torch.cuda.synchronize()
         t0 = time.time()
 
@@ -412,15 +509,9 @@ if __name__ == "__main__":
             # per_gpu_batch_size in the denominator (since the loss is averaged over the local batch) and then when we sync gradients with
             # the .backward() call (with require_backward_grad_sync True), they are averaged over all ranks, so the resulting gradient has
             # per_gpu_batch_size * num_gpus in the denominator. Dividing the loss by grad_accum_steps gives us the correct final denominator.
-            loss = loss_DWDSE(log_score_model=model, x_0=x0, t=t, ctmc=ctmc) / grad_accum_steps
+            loss = ctmc.loss_DWDSE(log_score_model=model, x_0=x0, t=t, ctmc=ctmc) / grad_accum_steps
             train_loss += loss.detach() # for logging
             loss.backward()
-
-            for name, param in model.named_parameters():
-                if param.grad is not None:
-                    if torch.isnan(param.grad).any():
-                        print(f"    [{micro_step=}] {name=}: gradient contains NaN")
-                        print(f"    {param.grad=}")
 
         if dist.is_initialized():
             dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # for logging

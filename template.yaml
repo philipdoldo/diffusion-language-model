@@ -1,15 +1,15 @@
-effective_batch_size: 4
-batch_size: 2
-grad_accum_steps: 2
-training_steps: 5
+effective_batch_size: 512 #256
+batch_size: 8 #16
+grad_accum_steps: 4
+training_steps: 100000
 
 train_shard_dir: "/mnt/data_r60_1/adv_robust_project/diffusion-language-model/OWT/train"
-seq_len: 8 #512
+seq_len: 1024 #8 #512
 
 # Cosine Decay LR Schedule
 max_lr: 3.0e-4
 min_lr: 3.0e-5
-warmup_steps: 100
+warmup_steps: 2000
 
 val_loss_interval: 100
 checkpoint_interval: 100
@@ -32,7 +32,7 @@ AdamW_betas: [0.9, 0.95]
 AdamW_epsilon: 1.0e-8
 
 UniformCTMC:
-  sigma_min: 1.0e-4
-  sigma_max: 20
+  sigma_min: 1.0e-3 #1.0e-4
+  sigma_max: 1 #20
 
 rng_seed: 21

@@ -249,16 +249,21 @@ class DiT(nn.Module):
         ids j and token_ids[batch_index][i] are different token ids. 
 
         Important: We are actually learning the log of the scores here instead of the scores because
-        it makes the loss a bit easier to compute. Entries corresponding to the same token id will get
-        mapped to 0. This makes the sum excluding the same token in L_DWDSE easier to compute. This
-        means that we need to exponentiate the model output when doing inference to obtain the actual
-        scores. I took this idea from (for example) here: https://github.com/louaaron/Score-Entropy-Discrete-Diffusion/blob/main/model/utils.py#L51
+        the SEDD paper did it and I'm trying to reduce differences to resolves training stability 
+        issues. Entries corresponding to the same token id will get mapped to 0. This makes the L_DWDSE
+        loss easier to compute because TODO TODO TODO
+        
+        
+        This makes the sum 
+        excluding the same token in L_DWDSE easier to compute. This means that we need to exponentiate
+        the model output when doing inference to obtain the actual scores. I took this idea from (for
+        example) here: https://github.com/louaaron/Score-Entropy-Discrete-Diffusion/blob/main/model/utils.py#L51
         """
         cos_sin = self.cos, self.sin
 
         c = self.time_emb(t) # (batch_size, embed_dim)
         scale, shift = self.final_ada_ln_proj(c) # 2-tuple of tensors of shape (batch_size, embed_dim) 
-        print(f"{scale.shape=}, {shift.shape=}, {scale=}, {shift=}")
+        # print(f"{scale.shape=}, {shift.shape=}, {scale=}, {shift=}")
 
         x = self.token_emb(token_ids) # (batch_size, seq_len, embed_dim)
         for block in self.blocks:
@@ -272,7 +277,7 @@ class DiT(nn.Module):
         #     for j in range(seq_len):
         #         for k in range(1):  # token_ids[..., None] has shape (batch_size, seq_len, 1)
         #             scores[i][j][token_ids[i][j][k]] = 0
-        log_scores = torch.scatter(log_scores, -1, token_ids[..., None], torch.zeros_like(log_scores[..., :1]))
+        log_scores = torch.scatter(log_scores, -1, token_ids[..., None], torch.zeros_like(log_scores[..., :1])) # TODO uhhh do we even need this?? i think no??
 
         return log_scores
 

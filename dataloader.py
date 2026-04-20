@@ -40,6 +40,8 @@ class ShardDataLoader:
         self.current_position = self.rank * self.batch_size * self.seq_len
 
     def next_batch(self):
+        if self.tokens is None:
+            print(f"{self.current_position=}, {self.shard_index=}, {self.batch_size=}, {self.seq_len=}, {self.shards=}")
         x = self.tokens[self.current_position : self.current_position + self.batch_size * self.seq_len].view(self.batch_size, self.seq_len)
         t = torch.rand(self.batch_size)
 

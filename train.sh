@@ -1,8 +1,8 @@
 #!/bin/bash
 
 #SBATCH --job-name=t
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
+#SBATCH --nodes=4
+#SBATCH --ntasks=4
 #SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=16
 #SBATCH -o /mnt/data_r60_1/adv_robust_project/diffusion-language-model/logs/train_%A.log
@@ -25,7 +25,7 @@ export TORCH_MAX_MEMORY_FRACTION=0.98
 
 srun torchrun \
 --nnodes $SLURM_NNODES \
---nproc_per_node 1 \
+--nproc_per_node 4 \
 --rdzv_id $RANDOM \
 --rdzv_backend c10d \
 --rdzv_endpoint $head_node_ip:29500 \
