@@ -10,8 +10,8 @@ def rmsnorm(x):
     `x` has shape (B, L, d) and the RMS (which is just 2-norm scaled by 1/sqrt(d) in R^d) is computed for every vector of channels
     No learnable parameters. I want to try rmsnorm since I used it in language models. 
     """
-    rms = x.pow(2).mean(dim=-1, keepdim=True).sqrt() # shape (B, L, 1)
-    return (x / (rms + 1e-8))
+    rms = (x.pow(2).mean(dim=-1, keepdim=True) + 1e-8).sqrt() # shape (B, L, 1)
+    return (x / rms)
 
 
 def rmsnorm32(x):
@@ -293,19 +293,24 @@ if __name__ == "__main__":
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"{params=:,}, {trainable_params=:,}")
 
-
+    torch.autograd.set_detect_anomaly(True)
     loss = log_scores.sum()
     loss.backward()
 
-    for name, param in model.named_parameters():
-        if param.grad is not None:
-            if torch.isnan(param.grad).any():
-                print(f"NaN gradient in {name}")
-            else:
-                print(f"OK: {name}, grad norm: {param.grad.norm().item():.4f}")
-        else:
-            print(f"No gradient: {name}")
+    # for name, param in model.named_parameters():
+    #     if param.grad is not None:
+    #         if torch.isnan(param.grad).any():
+    #             print(f"NaN gradient in {name}")
+    #         else:
+    #             print(f"OK: {name}, grad norm: {param.grad.norm().item():.4f}")
+    #     else:
+    #         print(f"No gradient: {name}")
 
+    # print("drose0--------------")
+    # for name, param in model.named_parameters():
+    #     if param.grad is not None and torch.isnan(param.grad).any():
+    #         print(f"First NaN in: {name}")
+    #         break
 
 
 
