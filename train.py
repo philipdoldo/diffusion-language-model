@@ -177,28 +177,70 @@ def loss_DWDSE(log_score_model, x_0, t, ctmc):
     `p` has shape (batch_size, seq_len, vocab_size) and represents p_{t|0}(.|x_0^{i}) for each sequence position i and each batch index
     `sigma` has shape (batch_size,) and is simply sigma(t) corresponding to the noise schedule being used
     """
-    p = ctmc.transition(cols=x_0, t=t) # (batch_size, seq_len, vocab_size)
-    x_t = sample_categorical(p) # (batch_size, seq_len)
-    log_scores = log_score_model(token_ids=x_t, t=t) # (batch_size, seq_len, vocab_size)
-    sigma = ctmc.noise.sigma(t) # (batch_size,)
-    print(f"{t=}")
-    print(f"{sigma=}")
-    print(f"{log_scores=}")
-    print(f"{x_t=}")
-    print(f"{p=}")
+    p = ctmc.transition(cols=x_0, t=t)  # (batch_size, seq_len, vocab_size)
+    x_t = sample_categorical(p)  # (batch_size, seq_len)
+    log_scores = log_score_model(token_ids=x_t, t=t)  # (batch_size, seq_len, vocab_size)
+    sigma_bar = ctmc.noise.sigma_bar(t)  # (batch_size,)
+    dsigma = ctmc.noise.sigma(t)  # (batch_size,)
+    N = ctmc.N
 
-    # p.gather(dim=-1, index=x_t[..., None]) has the same shape as `index` which is (batch_size, seq_len, 1) in this case,
-    # each value is basically p_{t|0}(x_t^{i}|x_0^{i}). 
-    ratio = p / p.gather(dim=-1, index=x_t[..., None])  # (batch_size, seq_len, vocab_size)
-    assert not torch.isnan(ratio).any(), "DROSE"
-    assert not torch.isinf(ratio).any(), "OUU"
-    print(f"{ratio=}")
-    loss = (log_scores.exp() - ratio * log_scores).sum(dim=-1)  # (batch_size, seq_len) -- log_scores were zero'd when x_t^{i} = y in the forward pass, so the sum is correct here
-    print(f"[y]: {loss=}")
-    loss = (sigma[:, None] * loss).sum(dim=-1)  # (batch_size,)
-    print(f"[z]: {loss=}")
+    esigm1 = torch.where(
+        sigma_bar[:, None] < 0.5,
+        torch.expm1(sigma_bar[:, None]),
+        sigma_bar[:, None].exp() - 1
+    )  # (batch_size, seq_len)
+
+    # ratio = 1 - N / (esigm1 + N), the true score ratio when x_t == x_0
+    ratio = 1 - N / (esigm1 + N)  # (batch_size, seq_len)
+
+    # pos_term: (1/N) * sum_{y != x_t} s_theta(x_t)_y
+    scores = log_scores.exp()  # (batch_size, seq_len, vocab_size)
+    pos_term = scores.mean(dim=-1) - scores.gather(-1, x_t[..., None]).squeeze(-1) / N  # (batch_size, seq_len)
+
+    # neg_term: analytically computed using structure of uniform transition matrix
+    log_score_sum = log_scores.mean(dim=-1) - log_scores.gather(-1, x_t[..., None]).squeeze(-1) / N  # (batch_size, seq_len)
+    no_move = (x_t == x_0.long())  # (batch_size, seq_len)
+    neg_term = torch.where(
+        no_move,
+        ratio * log_score_sum,
+        log_scores.gather(-1, x_0[..., None].long()).squeeze(-1) / esigm1 + log_score_sum
+    )  # (batch_size, seq_len)
+
+    # const: K(r) term, makes loss non-negative, no gradient w.r.t. theta
+    const = torch.where(
+        no_move,
+        (N - 1) / N * ratio * (ratio.log() - 1),
+        ((-ratio.log() - 1) / ratio - (N - 2)) / N
+    ).detach()  # (batch_size, seq_len)
+
+    loss = pos_term - neg_term + const  # (batch_size, seq_len)
+    loss = (dsigma[:, None] * loss).sum(dim=-1)  # (batch_size,)
     loss = loss.mean()  # scalar
     return loss
+    # p = ctmc.transition(cols=x_0, t=t) # (batch_size, seq_len, vocab_size)
+    # x_t = sample_categorical(p) # (batch_size, seq_len)
+    # log_scores = log_score_model(token_ids=x_t, t=t) # (batch_size, seq_len, vocab_size)
+    # sigma = ctmc.noise.sigma(t) # (batch_size,)
+    # print(f"{t=}")
+    # print(f"{sigma=}")
+    # print(f"{log_scores=}")
+    # print(f"{x_t=}")
+    # print(f"{p=}")
+    # vocab_size = p.shape[-1]
+    # print(f"{vocab_size=}")
+
+    # # p.gather(dim=-1, index=x_t[..., None]) has the same shape as `index` which is (batch_size, seq_len, 1) in this case,
+    # # each value is basically p_{t|0}(x_t^{i}|x_0^{i}). 
+    # ratio = p / p.gather(dim=-1, index=x_t[..., None])  # (batch_size, seq_len, vocab_size)
+    # assert not torch.isnan(ratio).any(), "DROSE"
+    # assert not torch.isinf(ratio).any(), "OUU"
+    # print(f"{ratio=}")
+    # loss = (log_scores.exp() - ratio * log_scores).sum(dim=-1) / vocab_size  # (batch_size, seq_len) -- log_scores were zero'd when x_t^{i} = y in the forward pass, so the sum is correct here
+    # print(f"[y]: {loss=}")
+    # loss = (sigma[:, None] * loss).sum(dim=-1)  # (batch_size,)
+    # print(f"[z]: {loss=}")
+    # loss = loss.mean()  # scalar
+    # return loss
 
 """
 Now for the actual training loop...
@@ -373,6 +415,12 @@ if __name__ == "__main__":
             loss = loss_DWDSE(log_score_model=model, x_0=x0, t=t, ctmc=ctmc) / grad_accum_steps
             train_loss += loss.detach() # for logging
             loss.backward()
+
+            for name, param in model.named_parameters():
+                if param.grad is not None:
+                    if torch.isnan(param.grad).any():
+                        print(f"    [{micro_step=}] {name=}: gradient contains NaN")
+                        print(f"    {param.grad=}")
 
         if dist.is_initialized():
             dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # for logging

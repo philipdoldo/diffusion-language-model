@@ -1,10 +1,10 @@
 effective_batch_size: 4
 batch_size: 2
 grad_accum_steps: 2
-training_steps: 10000
+training_steps: 5
 
 train_shard_dir: "/mnt/data_r60_1/adv_robust_project/diffusion-language-model/OWT/train"
-seq_len: 512
+seq_len: 8 #512
 
 # Cosine Decay LR Schedule
 max_lr: 3.0e-4

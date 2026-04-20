@@ -294,6 +294,19 @@ if __name__ == "__main__":
     print(f"{params=:,}, {trainable_params=:,}")
 
 
+    loss = log_scores.sum()
+    loss.backward()
+
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            if torch.isnan(param.grad).any():
+                print(f"NaN gradient in {name}")
+            else:
+                print(f"OK: {name}, grad norm: {param.grad.norm().item():.4f}")
+        else:
+            print(f"No gradient: {name}")
+
+
 
 
 
