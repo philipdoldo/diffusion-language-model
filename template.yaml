@@ -32,7 +32,7 @@ AdamW_betas: [0.9, 0.999] #[0.9, 0.95]
 AdamW_epsilon: 1.0e-8
 
 UniformCTMC:
-  sigma_min: 1.0e-4 #1.0e-3 #1.0e-4
-  sigma_max: 20 #1 #20
+  sigma_min: 1.0e-3 #1.0e-4
+  sigma_max: 1 #20
 
 rng_seed: 21

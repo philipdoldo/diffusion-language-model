@@ -173,6 +173,7 @@ class UniformCTMC:
         """
         p = self.transition(cols=x_0, t=t) # (batch_size, seq_len, vocab_size)
         x_t = sample_categorical(p) # (batch_size, seq_len)
+        seq_len = x_t.shape[-1]
         log_scores = log_score_model(token_ids=x_t, t=t) # (batch_size, seq_len, vocab_size)
         # TODO x_0 is unit16, but x_t is int64, why?
 
@@ -210,7 +211,7 @@ class UniformCTMC:
         ) # (batch_size, seq_len) # TODO need to look into numerical stability of constant term!!!
 
         sigma = self.noise.sigma(t) # (batch_size,)
-        loss = sigma * (pos_term - neg_term + constant).sum(dim=-1) # (batch_size,)
+        loss = sigma * (pos_term - neg_term + constant).sum(dim=-1) / seq_len # (batch_size,) (I normalize by sequence length too even though I don't see that in their code)
 
         # assert torch.isfinite(pos_term).all()
         # assert torch.isfinite(neg_term).all()
