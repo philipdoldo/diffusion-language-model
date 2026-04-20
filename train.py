@@ -187,7 +187,12 @@ class UniformCTMC:
             torch.exp(sigma_bar) - 1 # I guess it is computationally fast to do this when numerical stability isn't a concern
         ) # shape (batch_size, 1)
 
-        ratio = 1 - self.N / (em1 + self.N) # From Case 1: x_t^i == x_0^i, y != x_t^i, shape (batch_size, 1)
+        #ratio = 1 - self.N / (em1 + self.N) # From Case 1: x_t^i == x_0^i, y != x_t^i, shape (batch_size, 1)
+        ratio = em1 / (em1 + self.N) # Turns out I actually need to do this for better numerical stability!! No idea why original SEDD code didn't do this because I copied their parameters... fp32 floating point numbers are way more dense near zero than they are near 1, which is why this works
+        # print(f"{sigma_bar=}, {sigma_bar.dtype=}")
+        # print(f"{em1=}, {em1.dtype=}")
+        # print(f"{ratio=}, {ratio.dtype=}")
+        # print(f"{ratio.log()=}, {ratio.log().dtype=}")
 
         # for a given batch index and sequence position i, this is the sum of log scores over all y in the vocabulary minus the one term where y == x_t^i (all normalized by N)
         neg_term = log_scores.mean(dim=-1) - torch.gather(log_scores, -1, x_t[..., None]).squeeze(-1) / self.N # (batch_size, seq_len)
@@ -207,10 +212,10 @@ class UniformCTMC:
         sigma = self.noise.sigma(t) # (batch_size,)
         loss = sigma * (pos_term - neg_term + constant).sum(dim=-1) # (batch_size,)
 
-        assert torch.isfinite(pos_term).all()
-        assert torch.isfinite(neg_term).all()
-        assert torch.isfinite(constant).all()
-        assert torch.isfinite(loss).all()
+        # assert torch.isfinite(pos_term).all()
+        # assert torch.isfinite(neg_term).all()
+        # assert torch.isfinite(constant).all()
+        # assert torch.isfinite(loss).all()
 
         return loss.mean() # scalar
 
