@@ -136,7 +136,7 @@ class UniformCTMC:
         p.scatter_add_(-1, cols[..., None].long(), c[:, None, None].expand(batch_size, seq_len, 1))
         return p # (batch_size, seq_len, N)
     
-    def loss_DWDSE(log_score_model, x_0, t):
+    def loss_DWDSE(self, log_score_model, x_0, t):
         """
         The Diffusion Weighted Denoising Score Entropy loss L_{DWDSE} from the SEDD paper https://arxiv.org/pdf/2310.16834 (see Algorithm 1)
 
@@ -174,9 +174,10 @@ class UniformCTMC:
         p = self.transition(cols=x_0, t=t) # (batch_size, seq_len, vocab_size)
         x_t = sample_categorical(p) # (batch_size, seq_len)
         log_scores = log_score_model(token_ids=x_t, t=t) # (batch_size, seq_len, vocab_size)
+        # TODO x_0 is unit16, but x_t is int64, why?
 
         scores = log_scores.exp() # (batch_size, seq_len, vocab_size)
-        pos_term = scores.mean(dim=-1) - torch.gather(scores, x_t[..., None]).squeeze(-1) / self.N # for each sequence position i, we subtract away the term in the scores where y == x_t^i (and we normalize all terms by N)
+        pos_term = scores.mean(dim=-1) - torch.gather(scores, -1, x_t[..., None]).squeeze(-1) / self.N # for each sequence position i, we subtract away the term in the scores where y == x_t^i (and we normalize all terms by N)
 
         sigma_bar = self.noise.sigma_bar(t[:, None]) # (batch_size, 1)
         # Compute  exp(sigma_bar(t)) - 1  in a numerically stable way
@@ -191,20 +192,26 @@ class UniformCTMC:
         # for a given batch index and sequence position i, this is the sum of log scores over all y in the vocabulary minus the one term where y == x_t^i (all normalized by N)
         neg_term = log_scores.mean(dim=-1) - torch.gather(log_scores, -1, x_t[..., None]).squeeze(-1) / self.N # (batch_size, seq_len)
         neg_term = torch.where(
-            x_t == x_0,
+            x_t == x_0.long(), # TODO
             ratio * neg_term, # Case 1: x_t^i == x_0^i, y != x_t^i 
-            neg_term + torch.gather(log_scores, -1, x_0[..., None]).squeeze(-1) / em1 # Case 2a is ratio=1, Case 2b is ratio=1+N/em1, neg_term is already (1/N) multiplied by each log score, we just need to add 1/em1 multiplied by the log score for x_0^i to get the proper ratio for that term (remember, all terms are normalized by N)
-        ) # shape (batch_size, seq_len)
+            neg_term + torch.gather(log_scores, -1, x_0[..., None].long()).squeeze(-1) / em1 # Case 2a is ratio=1, Case 2b is ratio=1+N/em1, neg_term is already (1/N) multiplied by each log score, we just need to add 1/em1 multiplied by the log score for x_0^i to get the proper ratio for that term (remember, all terms are normalized by N)
+        ) # shape (batch_size, seq_len)                         # TODO .long() here too
 
         # Constant term is sum of K(ratio) over all the ratios we used in neg_term, where K(a) := a*(log(a) - 1) 
         constant = torch.where(
-            x_t == x_0,
+            x_t == x_0.long(), # TODO
             ratio*(ratio.log() - 1) * (self.N - 1)/self.N, # Case 1, all ratios are the same and normalized by N, but we have N-1 terms, so (N-1)/N times the same K(ratio)
             ((-ratio.log() - 1) / ratio - (self.N - 2)) / self.N  # for all but one term, we get K(1) = 1*(log(1) - 1) = -1 (there are N-2 of these terms), for the remaining term the ratio we want is the reciprocal of the Case 1 ratio, so we use 1/ratio and -log(ratio) to get K(1/ratio) = (-ratio.log() - 1) / ratio. Finally, we normalize everything by N
-        ) # (batch_size, seq_len)
+        ) # (batch_size, seq_len) # TODO need to look into numerical stability of constant term!!!
 
         sigma = self.noise.sigma(t) # (batch_size,)
         loss = sigma * (pos_term - neg_term + constant).sum(dim=-1) # (batch_size,)
+
+        assert torch.isfinite(pos_term).all()
+        assert torch.isfinite(neg_term).all()
+        assert torch.isfinite(constant).all()
+        assert torch.isfinite(loss).all()
+
         return loss.mean() # scalar
 
 
@@ -335,8 +342,8 @@ TODO inference, val loss, perplexity/gen perplexity+entropy, checkpointing, resu
 """
 
 def print0(s="", **kwargs):
-    ddp_rank = int(os.environ.get('RANK', 0))
-    if ddp_rank == 0:
+    rank = int(os.environ.get('RANK', 0))
+    if rank == 0:
         print(s, **kwargs)
 
 def write0(s, log_file):
@@ -344,15 +351,15 @@ def write0(s, log_file):
     `s` is the string to write to the log file
     `log_file` is the path to the log.txt file
     """
-    ddp_rank = int(os.environ.get('RANK', 0))
-    if ddp_rank == 0:
+    rank = int(os.environ.get('RANK', 0))
+    if rank == 0:
         with open(log_file, 'a') as f:
             f.write(s)
 
 def create_log_dir(parent_dir):
-    ddp_rank = int(os.environ.get('RANK', 0))
+    rank = int(os.environ.get('RANK', 0))
     log_dir = None # initialize as None to avoid errors on nonzero ranks
-    if ddp_rank == 0:
+    if rank == 0:
         timestamp = datetime.now().strftime("%m-%d-%Y-%Hh%Mm%Ss")
         log_dir = os.path.join(parent_dir, f"{timestamp}")
         os.makedirs(log_dir, exist_ok=True)
@@ -475,7 +482,7 @@ if __name__ == "__main__":
     for step in range(training_steps):
 
         # SAVE CHECKPOINTS
-        if ddp_rank == 0 and (step % checkpoint_interval == 0 or step == training_steps - 1):
+        if rank == 0 and (step % checkpoint_interval == 0 or step == training_steps - 1):
             torch.cuda.synchronize()
             t0 = time.time()
             checkpoint = {
@@ -509,7 +516,7 @@ if __name__ == "__main__":
             # per_gpu_batch_size in the denominator (since the loss is averaged over the local batch) and then when we sync gradients with
             # the .backward() call (with require_backward_grad_sync True), they are averaged over all ranks, so the resulting gradient has
             # per_gpu_batch_size * num_gpus in the denominator. Dividing the loss by grad_accum_steps gives us the correct final denominator.
-            loss = ctmc.loss_DWDSE(log_score_model=model, x_0=x0, t=t, ctmc=ctmc) / grad_accum_steps
+            loss = ctmc.loss_DWDSE(log_score_model=model, x_0=x0, t=t) / grad_accum_steps
             train_loss += loss.detach() # for logging
             loss.backward()
 
