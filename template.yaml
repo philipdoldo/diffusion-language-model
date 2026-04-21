@@ -1,6 +1,6 @@
 effective_batch_size: 512 #256
-batch_size: 8 #16
-grad_accum_steps: 4
+batch_size: 16 #16
+grad_accum_steps: 2
 training_steps: 100000
 ema_decay: 0.9999
 
