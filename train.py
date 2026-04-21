@@ -188,12 +188,8 @@ class UniformCTMC:
             torch.exp(sigma_bar) - 1 # I guess it is computationally fast to do this when numerical stability isn't a concern
         ) # shape (batch_size, 1)
 
-        #ratio = 1 - self.N / (em1 + self.N) # From Case 1: x_t^i == x_0^i, y != x_t^i, shape (batch_size, 1)
+        # ratio = 1 - self.N / (em1 + self.N) # From Case 1: x_t^i == x_0^i, y != x_t^i, shape (batch_size, 1)
         ratio = em1 / (em1 + self.N) # Turns out I actually need to do this for better numerical stability!! No idea why original SEDD code didn't do this because I copied their parameters... fp32 floating point numbers are way more dense near zero than they are near 1, which is why this works
-        # print(f"{sigma_bar=}, {sigma_bar.dtype=}")
-        # print(f"{em1=}, {em1.dtype=}")
-        # print(f"{ratio=}, {ratio.dtype=}")
-        # print(f"{ratio.log()=}, {ratio.log().dtype=}")
 
         # for a given batch index and sequence position i, this is the sum of log scores over all y in the vocabulary minus the one term where y == x_t^i (all normalized by N)
         neg_term = log_scores.mean(dim=-1) - torch.gather(log_scores, -1, x_t[..., None]).squeeze(-1) / self.N # (batch_size, seq_len)
@@ -208,15 +204,10 @@ class UniformCTMC:
             x_t == x_0.long(), # TODO
             ratio*(ratio.log() - 1) * (self.N - 1)/self.N, # Case 1, all ratios are the same and normalized by N, but we have N-1 terms, so (N-1)/N times the same K(ratio)
             ((-ratio.log() - 1) / ratio - (self.N - 2)) / self.N  # for all but one term, we get K(1) = 1*(log(1) - 1) = -1 (there are N-2 of these terms), for the remaining term the ratio we want is the reciprocal of the Case 1 ratio, so we use 1/ratio and -log(ratio) to get K(1/ratio) = (-ratio.log() - 1) / ratio. Finally, we normalize everything by N
-        ) # (batch_size, seq_len) # TODO need to look into numerical stability of constant term!!!
+        ) # (batch_size, seq_len)
 
         sigma = self.noise.sigma(t) # (batch_size,)
         loss = sigma * (pos_term - neg_term + constant).sum(dim=-1) / seq_len # (batch_size,) (I normalize by sequence length too even though I don't see that in their code)
-
-        # assert torch.isfinite(pos_term).all()
-        # assert torch.isfinite(neg_term).all()
-        # assert torch.isfinite(constant).all()
-        # assert torch.isfinite(loss).all()
 
         return loss.mean() # scalar
 

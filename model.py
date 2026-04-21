@@ -18,8 +18,8 @@ def rmsnorm32(x):
     """
     rmsnorm but now with float32 precision just in case that ends up being important for stability
     """
-    rms = x.float().pow(2).mean(dim=-1, keepdim=True).sqrt()
-    return (x / (rms + 1e-8)).type(x.dtype)
+    rms = x.float().pow(2).mean(dim=-1, keepdim=True + 1e-8).sqrt()
+    return (x / rms).type(x.dtype)
 
 
 class SinusoidalEmbedding(nn.Module):
@@ -271,13 +271,13 @@ class DiT(nn.Module):
         x = F.layer_norm(x, [x.shape[-1]]) * scale + shift
         log_scores = self.lm_head(x) # (batch_size, seq_len, vocab_size)
 
-        # Remove scores corresponding to the input token id by setting them to zero
-        # torch.scatter() is basically doing a vectorized version of this: 
-        # for i in range(batch_size):
-        #     for j in range(seq_len):
-        #         for k in range(1):  # token_ids[..., None] has shape (batch_size, seq_len, 1)
-        #             scores[i][j][token_ids[i][j][k]] = 0
-        log_scores = torch.scatter(log_scores, -1, token_ids[..., None], torch.zeros_like(log_scores[..., :1])) # TODO uhhh do we even need this?? i think no??
+        # # Remove scores corresponding to the input token id by setting them to zero
+        # # torch.scatter() is basically doing a vectorized version of this: 
+        # # for i in range(batch_size):
+        # #     for j in range(seq_len):
+        # #         for k in range(1):  # token_ids[..., None] has shape (batch_size, seq_len, 1)
+        # #             scores[i][j][token_ids[i][j][k]] = 0
+        # log_scores = torch.scatter(log_scores, -1, token_ids[..., None], torch.zeros_like(log_scores[..., :1])) # TODO uhhh do we even need this?? i think no??
 
         return log_scores
 
