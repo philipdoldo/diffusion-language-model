@@ -441,7 +441,7 @@ if __name__ == "__main__":
     write0(f"Model Parameters: {num_params:,}\nTrainable Model Parameters: {num_trainable_params:,}\n", log_file=log_file)
 
     train_loader = ShardDataLoader(shard_dir=config["train_shard_dir"], batch_size=batch_size, seq_len=config["seq_len"])
-    val_loader = ShardDataLoader(shard_dir=config["val_shard_dir"], batch_size=batch_size, seq_len=config["seq_len"])
+    #val_loader = ShardDataLoader(shard_dir=config["val_shard_dir"], batch_size=batch_size, seq_len=config["seq_len"])
     
     torch.manual_seed(config["rng_seed"] + rank) # for sampling times
 
@@ -475,28 +475,34 @@ if __name__ == "__main__":
             t1 = time.time()
             write0(f" --- Checkpoint saved to {checkpoint_path} in {t1-t0:.4f}s\n", log_file=log_file)
 
-        if False and (step % val_loss_interval == 0 or step == training_steps - 1):
-            assert False # TODO
+        if rank == 0 and (step % val_loss_interval == 0 or step == training_steps - 1):
             with torch.no_grad():
-
-                (config["val_tokens"] // (world_size * config["seq_len"])) % config["batch_size"]
-
-                tokens_per_batch = config["batch_size"] * config["seq_len"]
+                
+                t0 = time.time()
+                val_loader = ShardDataLoader(shard_dir=config["val_shard_dir"], batch_size=batch_size, seq_len=config["seq_len"]) # does this properly reset rng seed?
+                val_loader.reset() # should be unnecessary
 
                 ema.store(model.parameters()) # store copy of the actual model weights
                 ema.copy_to(model.parameters()) # copy EMA weights into the model
-                val_loss = ... # TODO need good val loader logic
+                val_losses = []
+                for val_step in range(config.get("val_steps", 98)):
+                    val_x0, val_t = val_loader.next_batch
+                    val_loss = ctmc.loss_DWDSE(log_score_model=model, x_0=x0, t=t)
+                    val_losses.append(val_loss)
+                val_loss = torch.mean(val_losses)
                 ema.restore(model.parameters()) # copy stored model weights back into the model
+                t1 = time.time()
+                write0(f"val loss: {val_loss}{' '*(8 - len(str(step)))}{(t1-t0)*1000:.0f}ms\n", log_file=log_file)
 
         torch.cuda.synchronize()
         t0 = time.time()
 
-        x0, t = train_loader.next_batch()
-        x0 = x0.to(device)
-        t = t.to(device)
-
         train_loss = 0.0 # for logging
         for micro_step in range(grad_accum_steps):
+
+            x0, t = train_loader.next_batch()
+            x0 = x0.to(device)
+            t = t.to(device)
 
             if ddp: # only sync gradients on the last micro step
                 model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)

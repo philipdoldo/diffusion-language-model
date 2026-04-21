@@ -25,7 +25,6 @@ class ShardDataLoader:
 
         torch.manual_seed(rng_seed + self.rank) 
 
-
         self.reset()
 
     def load_tokens(self):
@@ -49,12 +48,12 @@ class ShardDataLoader:
         # if loading the next batch would be out of bounds, advance to the next shard
         if self.current_position + self.batch_size * self.seq_len * self.world_size >= len(self.tokens):
             self.shard_index = (self.shard_index + 1) % len(self.shards)
-            self.tokens = self.load_tokens()
+            self.load_tokens()
             self.current_position = self.rank * self.batch_size * self.seq_len
         return x, t
 
     def get_state_dict(self):
-        if self.rank == 0 and self.worker_id == 0:
+        if self.rank == 0:
             return {"current_position": self.current_position, "shard_index": self.shard_index}
         raise RuntimeError(f"get_state_dict can only be called on rank 0, but {self.rank=}")
 
@@ -62,3 +61,4 @@ class ShardDataLoader:
         if state_dict is not None:
             self.current_position = state_dict["current_position"]
             self.shard_index = state_dict["shard_index"]
+            self.load_tokens()
