@@ -212,11 +212,6 @@ class UniformCTMC:
         return loss.mean() # scalar
 
 
-
-
-
-
-
 def sample_categorical(p):
     """
     `p` has shape (batch_size, seq_len, vocab_size) and is basically p_{t|0}(.|x_0^{i}) for each sequence index i and each batch index
@@ -244,86 +239,69 @@ def sample_categorical(p):
     return (p / exp_norm).argmax(dim=-1) # shape (batch_size, seq_len)
 
 
-# def loss_DWDSE(log_score_model, x_0, t, ctmc):
-#     """
-#     The Diffusion Weighted Denoising Score Entropy loss L_{DWDSE} from the SEDD paper https://arxiv.org/pdf/2310.16834 (see Algorithm 1)
+class ExponentialMovingAverage:
+    """
+    Maintains exponential moving average of model parameters, i.e., ema_params = (1-a)*new_params + a*ema_params for a in [0,1]
+    Based on: https://github.com/louaaron/Score-Entropy-Discrete-Diffusion/blob/main/model/ema.py#L10
 
-#     `log_score_model` is our neural network that outputs `log_scores`
-#     `x_0` has shape (batch_size, seq_len) and is a sequence of token ids sampled from p_data
-#     `t` has shape (batch_size,)
-#     `ctmc` is an instance of our UniformCTMC class, we'll use it to compute `p` and `sigma`
+    When training diffusion models, people often use an EMA of weights for inference instead of the actual weights used during training
+    """
+    def __init__(self, params, decay=0.9999):
+        """
+            `params`: Iterable of `torch.nn.Parameter`; usually the result of `model.parameters()`.
+            `decay` : float in [0,1]
+        """
+        if decay < 0 or decay > 1:
+            raise ValueError(f"Decay must be in [0,1], but {decay=}")
+        self.decay = decay
+        self.ema_params = [p.clone().detach() for p in params if p.requires_grad]
+        self.copied_params = []
 
-#     `log_scores` has shape (batch_size, seq_len, vocab_size) where log_scores corresponding to the original token id are 0 (see model.py)
-#     `p` has shape (batch_size, seq_len, vocab_size) and represents p_{t|0}(.|x_0^{i}) for each sequence position i and each batch index
-#     `sigma` has shape (batch_size,) and is simply sigma(t) corresponding to the noise schedule being used
-#     """
-#     # p = ctmc.transition(cols=x_0, t=t)  # (batch_size, seq_len, vocab_size)
-#     # x_t = sample_categorical(p)  # (batch_size, seq_len)
-#     # log_scores = log_score_model(token_ids=x_t, t=t)  # (batch_size, seq_len, vocab_size)
-#     # sigma_bar = ctmc.noise.sigma_bar(t)  # (batch_size,)
-#     # dsigma = ctmc.noise.sigma(t)  # (batch_size,)
-#     # N = ctmc.N
+    def update(self, params):
+        """
+        Update currently maintained parameters.
+        Call this every time the parameters are updated, such as the result of the `optimizer.step()` call.
+        Args:
+            params: Iterable of `torch.nn.Parameter`; usually the same set of parameters used to initialize this object.
+        """
+        with torch.no_grad():
+            for ema_p, p in zip(self.ema_params, [p for p in params if p.requires_grad]):
+                ema_p.mul_(self.decay).add_(p, alpha=1 - self.decay) # ema_p = decay*ema_p + (1-decay)*p, update ema params in-place
 
-#     # esigm1 = torch.where(
-#     #     sigma_bar[:, None] < 0.5,
-#     #     torch.expm1(sigma_bar[:, None]),
-#     #     sigma_bar[:, None].exp() - 1
-#     # )  # (batch_size, seq_len)
+    def copy_to(self, params):
+        """
+        Copy EMA parameters into given collection of parameters.
+        Args:
+            params: Iterable of `torch.nn.Parameter`; the parameters to be updated with the stored moving averages.
+        """
+        for ema_p, p in zip(self.ema_params, [p for p in params if p.requires_grad]):
+            p.data.copy_(ema_p.data)
 
-#     # # ratio = 1 - N / (esigm1 + N), the true score ratio when x_t == x_0
-#     # ratio = 1 - N / (esigm1 + N)  # (batch_size, seq_len)
+    def store(self, params):
+        """
+        Save the current parameters for restoring later.
+        Args:
+            params: Iterable of `torch.nn.Parameter`; the parameters to be temporarily stored.
+        """
+        self.copied_params = [p.clone() for p in params]
 
-#     # # pos_term: (1/N) * sum_{y != x_t} s_theta(x_t)_y
-#     # scores = log_scores.exp()  # (batch_size, seq_len, vocab_size)
-#     # pos_term = scores.mean(dim=-1) - scores.gather(-1, x_t[..., None]).squeeze(-1) / N  # (batch_size, seq_len)
+    def restore(self, params):
+        """
+        Restore the parameters stored with the `store` method. Useful to validate the model with EMA parameters without affecting the
+        original optimization process. Store the parameters before the `copy_to` method. After validation (or model saving), use this
+        to restore the former parameters.
+        Args:
+            params: Iterable of `torch.nn.Parameter`; the parameters to be updated with the stored parameters.
+        """
+        for t, p in zip(self.copied_params, params):
+            p.data.copy_(t.data)
 
-#     # # neg_term: analytically computed using structure of uniform transition matrix
-#     # log_score_sum = log_scores.mean(dim=-1) - log_scores.gather(-1, x_t[..., None]).squeeze(-1) / N  # (batch_size, seq_len)
-#     # no_move = (x_t == x_0.long())  # (batch_size, seq_len)
-#     # neg_term = torch.where(
-#     #     no_move,
-#     #     ratio * log_score_sum,
-#     #     log_scores.gather(-1, x_0[..., None].long()).squeeze(-1) / esigm1 + log_score_sum
-#     # )  # (batch_size, seq_len)
+    def state_dict(self):
+        return dict(decay=self.decay, ema_params=self.ema_params)
 
-#     # # const: K(r) term, makes loss non-negative, no gradient w.r.t. theta
-#     # const = torch.where(
-#     #     no_move,
-#     #     (N - 1) / N * ratio * (ratio.log() - 1),
-#     #     ((-ratio.log() - 1) / ratio - (N - 2)) / N
-#     # ).detach()  # (batch_size, seq_len)
-
-#     # loss = pos_term - neg_term + const  # (batch_size, seq_len)
-#     # loss = (dsigma[:, None] * loss).sum(dim=-1)  # (batch_size,)
-#     # loss = loss.mean()  # scalar
-#     # return loss
-
-#     ############################################################## original
-#     p = ctmc.transition(cols=x_0, t=t) # (batch_size, seq_len, vocab_size)
-#     x_t = sample_categorical(p) # (batch_size, seq_len)
-#     log_scores = log_score_model(token_ids=x_t, t=t) # (batch_size, seq_len, vocab_size)
-#     sigma = ctmc.noise.sigma(t) # (batch_size,)
-#     # print(f"{t=}")
-#     # print(f"{sigma=}")
-#     # print(f"{log_scores=}")
-#     # print(f"{x_t=}")
-#     # print(f"{p=}")
-#     vocab_size = p.shape[-1]
-#     # print(f"{vocab_size=}")
-
-#     # p.gather(dim=-1, index=x_t[..., None]) has the same shape as `index` which is (batch_size, seq_len, 1) in this case,
-#     # each value is basically p_{t|0}(x_t^{i}|x_0^{i}). 
-#     ratio = p / p.gather(dim=-1, index=x_t[..., None])  # (batch_size, seq_len, vocab_size)
-#     # print(f"{ratio=}")
-#     log_scores_exp = log_scores.exp()
-#     log_scores_exp = torch.scatter(log_scores_exp, -1, x_t[..., None], torch.zeros_like(log_scores[..., :1]))
-
-#     loss = (log_scores.exp() - ratio * log_scores).sum(dim=-1) / vocab_size  # (batch_size, seq_len) -- log_scores were zero'd when x_t^{i} = y in the forward pass, so the sum is correct here
-#     # print(f"[y]: {loss=}")
-#     loss = (sigma[:, None] * loss).sum(dim=-1)  # (batch_size,)
-#     # print(f"[z]: {loss=}")
-#     loss = loss.mean()  # scalar
-#     return loss
+    def load_state_dict(self, state_dict):
+        self.decay = state_dict['decay']
+        self.ema_params = state_dict['ema_params']
 
 """
 Now for the actual training loop...
@@ -463,10 +441,12 @@ if __name__ == "__main__":
     write0(f"Model Parameters: {num_params:,}\nTrainable Model Parameters: {num_trainable_params:,}\n", log_file=log_file)
 
     train_loader = ShardDataLoader(shard_dir=config["train_shard_dir"], batch_size=batch_size, seq_len=config["seq_len"])
+    val_loader = ShardDataLoader(shard_dir=config["val_shard_dir"], batch_size=batch_size, seq_len=config["seq_len"])
     
     torch.manual_seed(config["rng_seed"] + rank) # for sampling times
 
     ctmc = UniformCTMC(config)
+    ema = ExponentialMovingAverage(params=model.parameters(), decay=config["ema_decay"])
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -483,9 +463,11 @@ if __name__ == "__main__":
             torch.cuda.synchronize()
             t0 = time.time()
             checkpoint = {
-                'step': step,
-                'model': model.module.state_dict() if ddp else model.state_dict(),
-                'optimizer': optimizer.state_dict(),
+                'step' : step,
+                'model' : model.module.state_dict() if ddp else model.state_dict(),
+                'optimizer' : optimizer.state_dict(),
+                'ema' : ema.ema_params,
+                'ema_decay' : ema.decay,
             }
             checkpoint_path = os.path.join(log_dir, f'checkpoints/checkpoint_step{step}.pt')
             torch.save(checkpoint, checkpoint_path)
@@ -493,8 +475,16 @@ if __name__ == "__main__":
             t1 = time.time()
             write0(f" --- Checkpoint saved to {checkpoint_path} in {t1-t0:.4f}s\n", log_file=log_file)
 
+        if rank == 0 and (step % val_loss_interval == 0 or step == training_steps - 1):
+            assert False # TODO
+            with torch.no_grad():
 
+                tokens_per_batch = config["batch_size"] * config["seq_len"]
 
+                ema.store(model.parameters()) # store copy of the actual model weights
+                ema.copy_to(model.parameters()) # copy EMA weights into the model
+                val_loss = ... # TODO need good val loader logic
+                ema.restore(model.parameters()) # copy stored model weights back into the model
 
         torch.cuda.synchronize()
         t0 = time.time()
@@ -525,6 +515,7 @@ if __name__ == "__main__":
         for param_group in optimizer.param_groups:
             param_group['lr'] = get_lr(step)
         optimizer.step()
+        ema.update(model.parameters())
         model.zero_grad(set_to_none=True)
         torch.cuda.synchronize()
         t1 = time.time()
