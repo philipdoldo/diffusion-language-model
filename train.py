@@ -486,10 +486,12 @@ if __name__ == "__main__":
                 ema.copy_to(model.parameters()) # copy EMA weights into the model
                 val_losses = []
                 for val_step in range(config.get("val_steps", 98)):
-                    val_x0, val_t = val_loader.next_batch
-                    val_loss = ctmc.loss_DWDSE(log_score_model=model, x_0=x0, t=t)
+                    val_x0, val_t = val_loader.next_batch()
+                    val_x0 = val_x0.to(device)
+                    val_t = val_t.to(device)
+                    val_loss = ctmc.loss_DWDSE(log_score_model=model, x_0=val_x0, t=val_t)
                     val_losses.append(val_loss)
-                val_loss = torch.mean(val_losses)
+                val_loss = sum(val_losses) / len(val_losses)
                 ema.restore(model.parameters()) # copy stored model weights back into the model
                 t1 = time.time()
                 write0(f"val loss: {val_loss}{' '*(8 - len(str(step)))}{(t1-t0)*1000:.0f}ms\n", log_file=log_file)
