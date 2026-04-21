@@ -95,7 +95,11 @@ For uniform diffusion, we are using Q = (11^T - N*I)/N = (1/N)*11^T - I and (1/N
 exponential is very easy to compute. This makes it so that 
     exp(sigma_bar(t)*Q) = (1 - exp(-sigma_bar(t)))*(1/N)*11^T + exp(-sigma_bar(t))*I
 which defines our transition probabilities p_{t|0}. In practice, we are going to start at some initial state x_0^{i} (a given token
-at sequence position i) and we'll care about only the corresponding column of our transition matrix given by p_{t|0}(.|x_0^{i}).
+at sequence position i) and we'll care about only the corresponding column of our transition matrix given by p_{t|0}(.|x_0^{i}). Notice
+how when sigma_bar(t) gets big, the transition probabilities converge to the uniform distribution:
+     exp(sigma_bar(t)*Q) = (1 - exp(-sigma_bar(t)))*(1/N)*11^T + exp(-sigma_bar(t))*I --> (1/N)*11^T as sigma_bar(t) --> +inf
+This justifies the choice of sigma_min=1e-4 and sigma_max=20 as exp(-1e-4) ~= 0.999900005 and exp(-20) ~= 2.06115362e-9, so indeed the KL div
+in the EBLO with L_DWDSE term will be really small
 """
 
 class UniformCTMC:
