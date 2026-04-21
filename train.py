@@ -475,9 +475,11 @@ if __name__ == "__main__":
             t1 = time.time()
             write0(f" --- Checkpoint saved to {checkpoint_path} in {t1-t0:.4f}s\n", log_file=log_file)
 
-        if rank == 0 and (step % val_loss_interval == 0 or step == training_steps - 1):
+        if False and (step % val_loss_interval == 0 or step == training_steps - 1):
             assert False # TODO
             with torch.no_grad():
+
+                (config["val_tokens"] // (world_size * config["seq_len"])) % config["batch_size"]
 
                 tokens_per_batch = config["batch_size"] * config["seq_len"]
 
