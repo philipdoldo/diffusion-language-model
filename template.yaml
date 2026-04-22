@@ -1,3 +1,6 @@
+resume_training: false
+checkpoint_path: ""
+
 effective_batch_size: 512 #256
 batch_size: 16 #16
 grad_accum_steps: 2

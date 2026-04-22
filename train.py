@@ -316,7 +316,7 @@ We'll sample a batch of times t ~ Unif([0,1]), it'll have shape (batch_size,)
 We can directly feed these into our loss function along with our model which outputs log scores and our CTMC that defines our forward noising process.
 Since our loss averages across the entire batch, we can scale it for gradient accumulation easily. 
 
-TODO inference, val loss, perplexity/gen perplexity+entropy, checkpointing, resuming training, sharded optimizer, fp16+scaler/bf16 handling, etc
+TODO inference, parallelize val loss, perplexity/gen perplexity+entropy, resuming training, sharded optimizer, fp16+scaler/bf16 handling, etc
 
 """
 
@@ -391,6 +391,19 @@ if __name__ == "__main__":
     model_config = DiTConfig.from_dict(config["model"])
     model = DiT(model_config) # this model outputs the log of the scores
 
+    if config.get("resume_training", False):
+        checkpoint = torch.load(config["checkpoint_path"], map_location="cpu")
+        # If we resume training, we change the rng seed in the config as a lazy way making sure we don't get the same random times and such
+        # I didn't bother storing rng state of each rank because I might resume with a different number of gpus anyway and it is simpler this way
+        # The checkpoint stores a set of all rng seeds used across all training runs to be sure we never repeat any of them (the gpus I'm using can have a lot of issues)
+        if config["rng_seed"] in checkpoint["rng_seeds"]:
+            raise ValueError(f"Change the rng seed in the config before you resume training! {checkpoint["rng_seeds"]=}, {config["rng_seed"]=}")
+
+        model.load_state_dict(checkpoint["model"])
+        print0(f"MODEL LOADED WITH CHECKPOINT {config["checkpoint_path"]}\n")
+    prior_rng_seeds = checkpoint["rng_seeds"] if config.get("resume_training", False) else set() # to be stored in checkpoint to be sure we don't accidentally resume training with a previously used rng seed
+    prior_rng_seeds.add(config["rng_seed"])
+
     ddp = int(os.environ.get('RANK', -1)) != -1
 
     if ddp:
@@ -420,7 +433,7 @@ if __name__ == "__main__":
     if rank == 0:
         with open(log_file, 'w') as f:
             f.write("") # initialize log file
-
+            
         with open(os.path.join(log_dir, "config.yaml"), "w") as f:
             yaml.dump(config, f) # save copy of yaml in log directory
 
@@ -444,13 +457,7 @@ if __name__ == "__main__":
     num_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     write0(f"Model Parameters: {num_params:,}\nTrainable Model Parameters: {num_trainable_params:,}\n", log_file=log_file)
 
-    train_loader = ShardDataLoader(shard_dir=config["train_shard_dir"], batch_size=batch_size, seq_len=config["seq_len"])
-    #val_loader = ShardDataLoader(shard_dir=config["val_shard_dir"], batch_size=batch_size, seq_len=config["seq_len"])
-    
-    torch.manual_seed(config["rng_seed"] + rank) # for sampling times
-
-    ctmc = UniformCTMC(config)
-    ema = ExponentialMovingAverage(params=model.parameters(), decay=config["ema_decay"])
+    train_loader = ShardDataLoader(shard_dir=config["train_shard_dir"], batch_size=batch_size, seq_len=config["seq_len"], rng_seed=config["rng_seed"])
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -459,8 +466,24 @@ if __name__ == "__main__":
         eps=config["AdamW_epsilon"],
         fused=True
         )
+    
+    ema = ExponentialMovingAverage(params=model.parameters(), decay=config["ema_decay"])
 
-    for step in range(training_steps):
+    if config.get("resume_training", False):
+        train_loader.load_state_dict(checkpoint["dataloader"])
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        ema.load_state_dict(checkpoint["ema"])
+
+        initial_step = checkpoint["step"]
+
+        write0(f"RESUMING TRAINING WITH CHECKPOINT {config["checkpoint_path"]} AT STEP {initial_step}\n", log_file=log_file)
+    else:
+        initial_step = 0 # if not resuming training, have training loop start at step 0
+
+    torch.manual_seed(config["rng_seed"] + rank) # (I guess this affects the categorical sampling, random times are in the dataloader)
+    ctmc = UniformCTMC(config)
+
+    for step in range(initial_step, training_steps):
 
         # SAVE CHECKPOINTS
         if rank == 0 and (step % checkpoint_interval == 0 or step == training_steps - 1):
@@ -470,8 +493,9 @@ if __name__ == "__main__":
                 'step' : step,
                 'model' : model.module.state_dict() if ddp else model.state_dict(),
                 'optimizer' : optimizer.state_dict(),
-                'ema' : ema.ema_params,
-                'ema_decay' : ema.decay,
+                'dataloader' : train_loader.get_state_dict(),
+                'ema' : {'ema_params' : ema.ema_params, 'decay' : ema.decay},
+                'rng_seeds' : prior_rng_seeds,
             }
             checkpoint_path = os.path.join(log_dir, f'checkpoints/checkpoint_step{step}.pt')
             torch.save(checkpoint, checkpoint_path)
@@ -483,7 +507,8 @@ if __name__ == "__main__":
             with torch.no_grad():
                 
                 t0 = time.time()
-                val_loader = ShardDataLoader(shard_dir=config["val_shard_dir"], batch_size=batch_size, seq_len=config["seq_len"]) # does this properly reset rng seed?
+                rng_state = torch.get_rng_state() # val might change rng state on rank 0, so save and restore it just in case, probably not very important
+                val_loader = ShardDataLoader(shard_dir=config["val_shard_dir"], batch_size=batch_size, seq_len=config["seq_len"]) # Should be reinitialized with same rng seed every time. Also notice how I intentionally use the default rng seed for val loader so that it never changes even when I resume training with a new rng seed in my config
                 val_loader.reset() # should be unnecessary
 
                 ema.store(model.parameters()) # store copy of the actual model weights
@@ -497,6 +522,7 @@ if __name__ == "__main__":
                     val_losses.append(val_loss)
                 val_loss = sum(val_losses) / len(val_losses)
                 ema.restore(model.parameters()) # copy stored model weights back into the model
+                torch.set_rng_state(rng_state) # restore rng state on rank 0
                 t1 = time.time()
                 write0(f"val loss: {val_loss}{' '*(8 - len(str(step)))}{(t1-t0)*1000:.0f}ms\n", log_file=log_file)
 

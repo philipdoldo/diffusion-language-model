@@ -58,7 +58,18 @@ class ShardDataLoader:
         raise RuntimeError(f"get_state_dict can only be called on rank 0, but {self.rank=}")
 
     def load_state_dict(self, state_dict):
+        """
+        `state_dict` is a dictionary that corresponds to rank 0. Since the values in it are from rank 0, we need to
+        adjust the current position and potentially the shard index for other ranks
+        """
         if state_dict is not None:
-            self.current_position = state_dict["current_position"]
-            self.shard_index = state_dict["shard_index"]
+            self.current_position = state_dict["current_position"] + self.rank * self.batch_size * self.seq_len
+            self.shard_index = state_dict["shard_index"] # rank 0's shard index, we might need to change it for other ranks
             self.load_tokens()
+            # if the loaded current position (based on rank 0's current position) is out of bounds, then move to the next shard
+            if self.current_position >= len(self.tokens):
+                if self.rank == 0:
+                    raise ValueError(f"Rank 0 should not have an incorrect shard index, check the validity of your checkpoint!")
+                self.shard_index = (self.shard_index + 1) % len(self.shards)
+                self.load_tokens()
+                self.current_position = self.rank * self.batch_size * self.seq_len
