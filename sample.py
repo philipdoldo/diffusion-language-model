@@ -27,7 +27,7 @@ if __name__ == "__main__":
     model.to(device)
 
     if args.checkpoint:
-        checkpoint = torch.load(config["checkpoint_path"], map_location="cpu")
+        checkpoint = torch.load(args.checkpoint, map_location="cpu")
         model.load_state_dict(checkpoint["model"])
 
     with torch.no_grad():
