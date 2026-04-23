@@ -16,6 +16,8 @@ if __name__ == "__main__":
     with open(args.config, "r") as f:
         config = yaml.safe_load(f)
 
+    torch.manual_seed(config["rng_seed"])
+
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
     ctmc = UniformCTMC(config)
