@@ -5,6 +5,7 @@ import os
 import math
 import time
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from datetime import datetime
 from model import DiT, DiTConfig
@@ -215,10 +216,72 @@ class UniformCTMC:
 
         return loss.mean() # scalar
 
+    def rate(self, cols, t):
+        """
+        `t` shape (batch_size,)
+        `cols` shape (batch_size, seq_len) -- these will be sequences of token ids
+        Returns columns of the rate matrix Q_t = sigma(t) * Q
+        """
+        batch_size, seq_len = cols.shape
+        Q = torch.ones((batch_size, seq_len, self.N), device=cols.device) / self.N # all non-diagonal entries of Q are 1/N
+        Q.scatter_(-1, cols[..., None], (1-self.N)/self.N) # diagonal entries of Q are (1-N)/N 
+        sigma = self.noise.sigma(t) # (batch_size,)
+        Q_t = sigma[:, None, None] * Q # (batch_size, seq_len, vocab_size)
+        return Q_t
+
+    def reverse_rate(self, scores, cols, t):
+        """
+        `scores` has shape (batch_size, seq_len, vocab_size) -- be sure these are the scores and not the log scores
+        `cols` shape (batch_size, seq_len) -- these will be sequences of token ids
+        `t` shape (batch_size,)
+        Returns columns of the reverse rate matrix. 
+
+        Recall that the reverse rate matrix satisfies Q_t^{reverse}(y|x) = Q_t(x|y)*(p_t(y)/p_t(x)) for y != x. So we'd need to transpose the forward
+        rate matrix, but for uniform diffusion it is symmetric so we don't need to bother transposing. Also, note that the factor of p_t(y)/p_t(x) will
+        be replaced by our learned scores.
+        """
+        Q_t = self.rate(cols, t) # no need to transpose for uniform diffusion    (batch_size, seq_len, vocab_size)
+        reverse_Q_t = Q_t * scores # element-wise multiplication, we need to correct the diagonal entries though    (batch_size, seq_len, vocab_size)
+        reverse_Q_t.scatter_(-1, cols[..., None], torch.zeros_like(reverse_Q_t)) # set diagonals to zero so we don't count them in our sum
+        reverse_Q_t.scatter_(-1, cols[..., None], -reverse_Q_t.sum(dim=-1, keepdim=True)) # diagonals are negative sum of nondiagonal terms
+        return reverse_Q_t # (batch_size, seq_len, vocab_size)
+
+    def forward_euler_sample(self, log_score_model, batch_size, seq_len, num_steps, device):
+        """
+        The most naive sampling approach: use forward Euler on the reverse process from t=1 to t=0
+
+        Note that we can linearize p_{t+h|t}(.|x) ~= p_{t|t}(.|x) + h * Q_t(.|x) = I(.|x) + h * Q_t(.|x) (where I(.|x) denotes column x of the identity matrix).
+        If h is sufficiently small, then this will be a probability distribution, but in practice h might not be small enough and so we'll need to clamp values
+        into [0, 1] and normalize it into a probability distribution. Also, we will be doing this for the reverse process, so we want to approximately sample 
+        from p_{t-h|t}(.|x_t) at each step.
+        """
+        if not (isinstance(num_steps, int) and num_steps > 0):
+            raise ValueError(f"{num_steps=}, but it must be a positive integer")
+        step_size = 1/num_steps
+
+        # sample initial noise from the uniform distribution (random token ids) at time t=1
+        t = torch.ones(batch_size, device=device) # (batch_size,)
+        x_t = torch.randint(low=0, high=self.N, size=(batch_size, seq_len), device=device) # (batch_size, seq_len)
+        for _ in range(num_steps):
+
+            log_scores = log_score_model(token_ids=x_t, t=t) # (batch_size, seq_len, vocab_size)
+            scores = log_scores.exp()
+
+            reverse_Q_t = self.reverse_rate(scores=scores, cols=x_t, t=t)
+
+            # Approximate p_{t-h|t}(.|x_t), clamp and normalize because it might not be a probability distribution otherwise
+            p = F.one_hot(x_t, num_classes=self.N) + step_size * reverse_Q_t # (batch_size, seq_len, vocab_size) -- may need to clamp and normalize along vocab dimension to ensure we get valid probability distributions
+            p = p.clamp(min=0.0, max=1.0)
+            p = p / p.sum(dim=-1, keepdim=True)
+
+            t = t - step_size
+            x_t = sample_categorical(p)
+        return x_t
+    
 
 def sample_categorical(p):
     """
-    `p` has shape (batch_size, seq_len, vocab_size) and is basically p_{t|0}(.|x_0^{i}) for each sequence index i and each batch index
+    `p` has shape (batch_size, seq_len, vocab_size) and is basically p_{t|0}(.|x_0^{i}) for each sequence index i and each batch index when training.
     This function samples a token in {0, ..., vocab_size-1} for each batch index and sequence position resulting in a tensor with
     shape (batch_size, seq_len). This is effectively sampling x_t^{i} ~  p_{t|0}(.|x_0^{i}) for each sequence position i and batch index.
 
@@ -397,10 +460,10 @@ if __name__ == "__main__":
         # I didn't bother storing rng state of each rank because I might resume with a different number of gpus anyway and it is simpler this way
         # The checkpoint stores a set of all rng seeds used across all training runs to be sure we never repeat any of them (the gpus I'm using can have a lot of issues)
         if config["rng_seed"] in checkpoint["rng_seeds"]:
-            raise ValueError(f"Change the rng seed in the config before you resume training! {checkpoint["rng_seeds"]=}, {config["rng_seed"]=}")
+            raise ValueError(f"Change the rng seed in the config before you resume training! {checkpoint['rng_seeds']=}, {config['rng_seed']=}")
 
         model.load_state_dict(checkpoint["model"])
-        print0(f"MODEL LOADED WITH CHECKPOINT {config["checkpoint_path"]}\n")
+        print0(f"MODEL LOADED WITH CHECKPOINT {config['checkpoint_path']}\n")
     prior_rng_seeds = checkpoint["rng_seeds"] if config.get("resume_training", False) else set() # to be stored in checkpoint to be sure we don't accidentally resume training with a previously used rng seed
     prior_rng_seeds.add(config["rng_seed"])
 
@@ -476,7 +539,7 @@ if __name__ == "__main__":
 
         initial_step = checkpoint["step"]
 
-        write0(f"RESUMING TRAINING WITH CHECKPOINT {config["checkpoint_path"]} AT STEP {initial_step}\n", log_file=log_file)
+        write0(f"RESUMING TRAINING WITH CHECKPOINT {config['checkpoint_path']} AT STEP {initial_step}\n", log_file=log_file)
     else:
         initial_step = 0 # if not resuming training, have training loop start at step 0
 

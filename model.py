@@ -250,14 +250,9 @@ class DiT(nn.Module):
 
         Important: We are actually learning the log of the scores here instead of the scores because
         the SEDD paper did it and I'm trying to reduce differences to resolves training stability 
-        issues. Entries corresponding to the same token id will get mapped to 0. This makes the L_DWDSE
-        loss easier to compute because TODO TODO TODO
-        
-        
-        This makes the sum 
-        excluding the same token in L_DWDSE easier to compute. This means that we need to exponentiate
-        the model output when doing inference to obtain the actual scores. I took this idea from (for
-        example) here: https://github.com/louaaron/Score-Entropy-Discrete-Diffusion/blob/main/model/utils.py#L51
+        issues. Also, since our model can output negatives value, outputting the log scores is convenient
+        since the scores should be nonnegative. This means that we need to exponentiate the model output 
+        when doing inference to obtain the actual scores. I took this idea from (for example) here: https://github.com/louaaron/Score-Entropy-Discrete-Diffusion/blob/main/model/utils.py#L51
         """
         cos_sin = self.cos, self.sin
 
