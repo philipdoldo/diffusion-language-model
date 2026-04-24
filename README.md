@@ -86,4 +86,4 @@ $$\overline{Q}_t(y|x) := \lim_{h \to 0+} \frac{p_{t-h|t}(y|x) - p_{t|t}(y|x)}{h}
 
 The diagonal entries (i.e., when $x = y$) are obtained by the fact that the nondiagonal entries are nonnegative and columns sum to zero.
 
-The ratios $\frac{p_t(y)}{p_t(x)}$ are referred to as the *scores* or *concrete scores*, analogous to the *score* that shows up as a correction to the drift term when time reversing an SDE in continuous diffusion. Given the simple structure of our forward rate matrix $Q_t = \sigma(t) Q$, we only need to learn the scores to effectively simulate the reverse process. 
+The ratios $\frac{p_t(y)}{p_t(x)}$ are referred to as the *scores* or *concrete scores*, analogous to the *score* that shows up in a correction to the drift term when time reversing an SDE in continuous diffusion. Given the simple structure of our forward rate matrix $Q_t = \sigma(t) Q$, we only need to learn the scores to effectively simulate the reverse process. 
