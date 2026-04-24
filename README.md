@@ -60,9 +60,11 @@ The KFE also applies to marginals:
 
 $$\frac{d}{dt} p_t = Q_t p_t$$
 
-$$\frac{d}{dt} p_t = \frac{d}{dt} p_{t|0}p_0 = Q_t p_{t|0} p_0 = Q_t p_t$$
+$$\frac{d}{dt} p_t = \frac{d}{dt} p_{t|0}p_0 = Q_t p_{t|0} p_0 = Q_t p_t$$ 
 
-We know that the marginal satisfies this ODE, but under some regularity conditions it can be shown that it is the unique solution for some initial condition given by $p_0$ by existence and uniqueness for ODEs. 
+(We used the fact that $p_{t|0}$ solves the KFE.)
+
+We know that the marginal satisfies this ODE, but under some regularity conditions it can be shown that it is the unique solution for some initial condition given by $p_0$ by existence and uniqueness for ODEs. We can view the KFE as a discrete analog of the Fokker-Planck equation (continuity equation) used in continuous diffusion (flow) models. 
 
 In the time-homogeneous case, the rate matrix $Q$ is not time dependent and we can solve the KFE to get
 
@@ -70,15 +72,15 @@ $$p_t = exp(Qt).$$
 
 In a slightly more complicated (but much more practical) case, we can assume a simple form for the rate matrix $Q_t := \sigma(t) Q$ for some scalar function $\sigma$ (this is what is done in the SEDD paper and my code) in which case solving the KFE gives
 
-$$p_{t|s} = \exp\left( \int_{s}^{t} \sigma(\tau) d \tau \, Q \right) $$
+$$p_{t|s} = \exp\left( \int_{s}^{t} \sigma(\tau) d \tau \, Q \right) := \exp\left( (\overline{\sigma}(t) - \overline{\sigma}(s)) \, Q \right) $$
 
-(note that we used the initial condition $p_{s|s} = I$). More generally, for a time-varying rate matrix $Q_t$, solving the KFE would result in a time-ordered exponential 
+where $\overline{\sigma}(t) := \int_{0}^{t} \sigma(\tau) d \tau$ (note that we used the initial condition $p_{s|s} = I$). Note that the marginals satisfy $p_t = \exp\left(\overline{\sigma}(t) Q \right) p_0$ which is effectively the solution we get for the time-homogeneous case except the time has been transformed from $t$ to $\overline{\sigma}(t)$ (in my code, this is the quantity that I refer to as `sigma_bar`). More generally, for a time-varying rate matrix $Q_t$, solving the KFE would result in a time-ordered exponential 
 
 $$p_{t|s} = I + \sum_{k=1}^{\infty} \int_{s}^{t} \int_{s}^{\tau_1} \cdots \int_{s}^{\tau_k} Q_{\tau_1} \cdots Q_{\tau_k d \tau_1 \cdots d \tau_k}$$
 
 which happens because in general $Q_t Q_s \neq Q_s Q_t$ (that is, the rate matrices at different times do not commute in general -- in fact, this is usually the case) You can obtain the time-ordered exponential by doing Picard iteration on the KFE. You can show that if all of the rate matrices commute, then it reduces to $p_{t|s} = \exp(\int_{s}^{t} Q_{\tau} d \tau)$. Thus, the assumption made in the SEDD paper that $Q_t = \sigma(t) Q$ simplifies the expression for the transition probabilities considerably. 
 
-For training a language model, we use a CTMC to define our forward noising process from pure data to pure noise to corrupt data at varying degrees that the model can learn to denoise. However, during inference in language modeling, we'll want to go from pure noise to pure data, so we'll want to simulate the reverse process. If our forward process goes from time $t=0$ to $t=T$, then the reverse process is the forward process with time $t$ replaced by $T-t$. Technically, we'd want to be careful and make sure that the reverse process itself is actually Markov. This is actually easy to see if you consider that an equivalent way of characterizing a Markov process is a process where the future and past are conditionally independent when given the present. The future and past may change roles when switching between the forward and reverse processes, but conditional independence w.r.t. the present state still holds and so the reverse process is Markov. As such, we can find a rate matrix $\overline{Q}_t$ for the reverse process CTMC.
+For training a language model, we use a CTMC to define our forward noising process from pure data to pure noise to corrupt data at varying degrees that the model can learn to denoise. However, during inference in language modeling, we'll want to go from pure noise to pure data, so we'll want to simulate the reverse process. If our forward process goes from time $t=0$ to $t=T$, then the reverse process is the forward process with time $t$ replaced by $T-t$. Technically, we'd want to be careful and make sure that the reverse process itself is actually Markov. This is actually easy to see if you consider that an equivalent way of characterizing a Markov process is as a process where the future and past are conditionally independent when given the present. The future and past may change roles when switching between the forward and reverse processes, but conditional independence w.r.t. the present state still holds and so the reverse process is Markov. As such, we can find a rate matrix $\overline{Q}_t$ for the reverse process CTMC.
 
 A way to get some intuiton for the reverse rate matrix $\overline{Q}_t$ is by perturbing time in the reverse direction and using Bayes (for $x,y \in S$ with $x \neq y$):
 
