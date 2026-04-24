@@ -46,7 +46,7 @@ We can show that for times $s < u < t$, the transition probabilities satisfy the
 
 $$p_{t|s} = p_{t|u} p_{u|s}$$
 
-which can be shown (making use of the Markov property):
+which can be shown as follows (making use of the Markov property):
 
 $$p_{t|s}(x|y) = P(x_t=x|x_s=y) = \sum_{z \in S}P(x_t=x,x_u=z|x_s=y) = \sum_{z \in S} P(x_t=x| x_u=z, x_s=y)P(x_u=z|x_s=y) = \sum_{z \in S} P(x_t=x | x_u=z)P(x_u=z|x_s=y) = \sum_{z \in S} p_{t|u}(x|z)p_{u|s}(z|y)$$
 
