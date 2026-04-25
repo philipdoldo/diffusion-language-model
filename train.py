@@ -433,11 +433,11 @@ if __name__ == "__main__":
 
     log_dir = create_log_dir(save_dir)
 
-    # Learning Rate Schedule (Cosine Decay)
+    # Learning Rate Schedule (Cosine Decay -- warmup + constant if you let min_lr = max_lr and cosine_decay_steps=0)
     warmup_steps = config["warmup_steps"]
     max_lr = config["max_lr"]
     min_lr = config.get("min_lr", max_lr/10)
-    lr_decay_steps = training_steps - warmup_steps
+    lr_decay_steps = config.get("cosine_decay_steps", training_steps - warmup_steps)
     def get_lr(it):
         # 1) linear warmup for warmup_steps steps
         if it < warmup_steps:
