@@ -1,9 +1,9 @@
-resume_training: false
-checkpoint_path: ""
+resume_training: true
+checkpoint_path: "/mnt/data_r60_1/adv_robust_project/diffusion-language-model/experiments/04-25-2026-02h49m18s/checkpoints/checkpoint_step26000.pt"
 
 effective_batch_size: 512 #256
-batch_size: 16 #16
-grad_accum_steps: 2
+batch_size: 8 #16 #16
+grad_accum_steps: 4 #2
 training_steps: 1000000
 ema_decay: 0.9999
 
@@ -31,7 +31,7 @@ model:
   sine_base: 10000
   num_attention_heads: 12
   rotary_base: 10000
-  num_blocks: 4
+  num_blocks: 12 # 4
   max_seq_len: 2048
 
 AdamW_weight_decay: 0 #0.01
@@ -42,4 +42,4 @@ UniformCTMC:
   sigma_min: 1.0e-4 # 1.0e-3 #1.0e-4
   sigma_max: 20 #1 #20
 
-rng_seed: 21
+rng_seed: 42 #21

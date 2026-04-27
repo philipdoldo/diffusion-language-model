@@ -366,9 +366,11 @@ class ExponentialMovingAverage:
     def state_dict(self):
         return dict(decay=self.decay, ema_params=self.ema_params)
 
-    def load_state_dict(self, state_dict):
+    def load_state_dict(self, state_dict, device=None):
         self.decay = state_dict['decay']
         self.ema_params = state_dict['ema_params']
+        if device is not None:
+            self.ema_params = [ema_p.to(device) for ema_p in self.ema_params]
 
 """
 Now for the actual training loop...
@@ -535,7 +537,7 @@ if __name__ == "__main__":
     if config.get("resume_training", False):
         train_loader.load_state_dict(checkpoint["dataloader"])
         optimizer.load_state_dict(checkpoint["optimizer"])
-        ema.load_state_dict(checkpoint["ema"])
+        ema.load_state_dict(checkpoint["ema"], device=device)
 
         initial_step = checkpoint["step"]
 

@@ -30,4 +30,4 @@ srun torchrun \
 --rdzv_backend c10d \
 --rdzv_endpoint $head_node_ip:29500 \
 /mnt/data_r60_1/adv_robust_project/diffusion-language-model/train.py \
---config "/mnt/data_r60_1/adv_robust_project/diffusion-language-model/template.yaml"
+--config "/mnt/data_r60_1/adv_robust_project/diffusion-language-model/constant-lr.yaml"
