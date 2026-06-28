@@ -201,8 +201,8 @@ class DiTBlock(nn.Module):
         """
         scale1, shift1, gate1, scale2, shift2, gate2 = self.ada_ln_proj(c)
 
-        x = x + gate1 * self.attn( x=F.layer_norm(x, [x.shape[-1]]) * scale1 + shift1, cos_sin=cos_sin ) # TODO maybe do layer norm in fp32?
-        x = x + gate2 * self.mlp( F.layer_norm(x, [x.shape[-1]]) * scale2 + shift2 )
+        x = x + gate1 * self.attn( x=F.layer_norm(x, [x.shape[-1]]) * (1 + scale1) + shift1, cos_sin=cos_sin ) # TODO maybe do layer norm in fp32?
+        x = x + gate2 * self.mlp( F.layer_norm(x, [x.shape[-1]]) * (1 + scale2) + shift2 )
         return x
 
 
@@ -263,7 +263,7 @@ class DiT(nn.Module):
         x = self.token_emb(token_ids) # (batch_size, seq_len, embed_dim)
         for block in self.blocks:
             x = block(x=x, c=c, cos_sin=cos_sin)
-        x = F.layer_norm(x, [x.shape[-1]]) * scale + shift
+        x = F.layer_norm(x, [x.shape[-1]]) * (1 + scale) + shift
         log_scores = self.lm_head(x) # (batch_size, seq_len, vocab_size)
 
         # # Remove scores corresponding to the input token id by setting them to zero
